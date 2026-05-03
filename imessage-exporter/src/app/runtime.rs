@@ -27,7 +27,7 @@ use imessage_database::{
 };
 
 use crate::{
-    Exporter, HTML, TXT,
+    Exporter, HTML, TXT, Timeline,
     app::{
         compatibility::attachment_manager::AttachmentManagerMode, contacts::Name,
         data_source::DataSource, error::RuntimeError, export_type::ExportType, options::Options,
@@ -566,6 +566,9 @@ impl Config {
                 }
                 ExportType::Txt => {
                     TXT::new(self)?.iter_messages()?;
+                }
+                ExportType::Timeline => {
+                    Timeline::new(self)?.iter_messages()?;
                 }
             }
         }

@@ -515,6 +515,7 @@ dependencies = [
 name = "imessage-exporter"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "clap",
  "crabapple",
  "fdlimit",
