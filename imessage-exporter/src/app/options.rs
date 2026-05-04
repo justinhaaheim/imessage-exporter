@@ -40,6 +40,7 @@ pub const OPTION_PLATFORM: &str = "platform";
 pub const OPTION_BYPASS_FREE_SPACE_CHECK: &str = "ignore-disk-warning";
 pub const OPTION_USE_CALLER_ID: &str = "use-caller-id";
 pub const OPTION_CONVERSATION_FILTER: &str = "conversation-filter";
+pub const OPTION_CONVERSATION_WITH: &str = "conversation-with";
 pub const OPTION_CLEARTEXT_PASSWORD: &str = "cleartext-password";
 pub const OPTION_CUSTOM_CONTACTS_DB_PATH: &str = "contacts-path";
 
@@ -82,6 +83,13 @@ pub struct Options {
     pub ignore_disk_space: bool,
     /// An optional filter for conversation participants
     pub conversation_filter: Option<String>,
+    /// Specific exact-match participant sets for conversation selection.
+    ///
+    /// Each entry is a comma-separated list of participant tokens describing
+    /// one specific conversation. A chat matches an entry when its
+    /// deduplicated non-self participant set equals the set the entry
+    /// resolves to. Multiple entries are unioned.
+    pub conversation_with: Vec<String>,
     /// An optional password for encrypted backups
     pub cleartext_password: Option<String>,
     /// An optional path to a custom contacts database
@@ -105,6 +113,10 @@ impl Options {
         let platform_type: Option<&String> = args.get_one(OPTION_PLATFORM);
         let ignore_disk_space = args.get_flag(OPTION_BYPASS_FREE_SPACE_CHECK);
         let conversation_filter: Option<&String> = args.get_one(OPTION_CONVERSATION_FILTER);
+        let conversation_with: Vec<String> = args
+            .get_many::<String>(OPTION_CONVERSATION_WITH)
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default();
         let cleartext_password: Option<&String> = args.get_one(OPTION_CLEARTEXT_PASSWORD);
         let contacts_path: Option<&String> = args.get_one(OPTION_CUSTOM_CONTACTS_DB_PATH);
 
@@ -129,6 +141,7 @@ impl Options {
                 (custom_name.is_some(), OPTION_CUSTOM_NAME),
                 (use_caller_id, OPTION_USE_CALLER_ID),
                 (conversation_filter.is_some(), OPTION_CONVERSATION_FILTER),
+                (!conversation_with.is_empty(), OPTION_CONVERSATION_WITH),
             ];
             for (set, opt) in format_deps {
                 if set {
@@ -150,6 +163,7 @@ impl Options {
             (use_caller_id, OPTION_USE_CALLER_ID),
             (custom_name.is_some(), OPTION_CUSTOM_NAME),
             (conversation_filter.is_some(), OPTION_CONVERSATION_FILTER),
+            (!conversation_with.is_empty(), OPTION_CONVERSATION_WITH),
         ];
         for (set, opt) in diag_conflicts {
             if diagnostic && set {
@@ -265,6 +279,7 @@ impl Options {
             platform,
             ignore_disk_space,
             conversation_filter: conversation_filter.cloned(),
+            conversation_with,
             cleartext_password: cleartext_password.cloned(),
             contacts_path: contacts_path.cloned().map(PathBuf::from),
         })
@@ -448,11 +463,20 @@ fn get_command() -> Command {
                 .value_name("filter"),
         )
         .arg(
+            Arg::new(OPTION_CONVERSATION_WITH)
+                .short('w')
+                .long(OPTION_CONVERSATION_WITH)
+                .help("Select a specific conversation by exact participant set\nEach -w value lists the comma-separated participants of one conversation\n(without yourself); only conversations whose deduplicated participant set\nequals that list are exported\nRepeat the flag to select multiple specific conversations (results are unioned)\nMay be combined with --conversation-filter; results are unioned\nExample: `-w 5558675309` selects only your DM with that number\nExample: `-w \"alice@apple.com,5558675309\"` selects only the group chat with exactly those two\nExample: `-w alice -w \"alice,bob\"` selects both the alice DM and the alice+bob group\n")
+                .action(ArgAction::Append)
+                .display_order(14)
+                .value_name("participants"),
+        )
+        .arg(
             Arg::new(OPTION_CLEARTEXT_PASSWORD)
                 .short('x')
                 .long(OPTION_CLEARTEXT_PASSWORD)
                 .help("Optional password for encrypted iOS backups\nThis is only used when the source is an encrypted iOS backup directory\n")
-                .display_order(14)
+                .display_order(15)
                 .value_name("password"),
         )
         .arg(
@@ -460,7 +484,7 @@ fn get_command() -> Command {
                 .short('n')
                 .long(OPTION_CUSTOM_CONTACTS_DB_PATH)
                 .help("Optional custom path for a macOS or iOS contacts database file\nThis should be resolved automatically, but can be manually provided\nHandles from the messages table will be mapped to names in the provided database\nGenerally, one of `AddressBook-v22.abcddb` or `AddressBook.sqlitedb`\n")
-                .display_order(15)
+                .display_order(16)
                 .value_name("path"),
         )
 }
@@ -486,6 +510,7 @@ impl Options {
             platform: Platform::macOS,
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         }
@@ -535,6 +560,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -618,6 +644,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -652,6 +679,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -732,6 +760,7 @@ mod arg_tests {
             platform: Platform::iOS,
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -771,6 +800,7 @@ mod arg_tests {
             platform: Platform::iOS,
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: Some("password".to_string()),
             contacts_path: None,
         };
@@ -826,6 +856,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -857,6 +888,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -889,6 +921,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: Some(String::from("steve@apple.com")),
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -920,6 +953,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -951,6 +985,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -991,6 +1026,79 @@ mod arg_tests {
     }
 
     #[test]
+    fn can_build_option_conversation_with_single() {
+        let command = get_command();
+        let args = command.get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "txt",
+            "-w",
+            "alice@apple.com",
+        ]);
+        let actual = Options::from_args(&args).unwrap();
+        assert_eq!(
+            actual.conversation_with,
+            vec![String::from("alice@apple.com")]
+        );
+    }
+
+    #[test]
+    fn can_build_option_conversation_with_repeated() {
+        // Repeating -w should append values, not overwrite.
+        let command = get_command();
+        let args = command.get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "txt",
+            "-w",
+            "alice",
+            "-w",
+            "alice,bob",
+        ]);
+        let actual = Options::from_args(&args).unwrap();
+        assert_eq!(
+            actual.conversation_with,
+            vec![String::from("alice"), String::from("alice,bob")]
+        );
+    }
+
+    #[test]
+    fn can_build_option_conversation_with_combined_with_filter() {
+        let command = get_command();
+        let args = command.get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "txt",
+            "-t",
+            "charlie",
+            "-w",
+            "alice,bob",
+        ]);
+        let actual = Options::from_args(&args).unwrap();
+        assert_eq!(actual.conversation_filter, Some(String::from("charlie")));
+        assert_eq!(
+            actual.conversation_with,
+            vec![String::from("alice,bob")]
+        );
+    }
+
+    #[test]
+    fn cant_build_option_conversation_with_no_export() {
+        // -w requires -f, just like -t.
+        let command = get_command();
+        let args = command.get_matches_from(["imessage-exporter", "-w", "alice"]);
+        assert!(Options::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn cant_build_option_conversation_with_diagnostic() {
+        // -w cannot be combined with diagnostics, just like -t.
+        let command = get_command();
+        let args = command.get_matches_from(["imessage-exporter", "-d", "-w", "alice"]);
+        assert!(Options::from_args(&args).is_err());
+    }
+
+    #[test]
     fn cant_build_option_no_lazy_without_format() {
         let args = get_command().get_matches_from(["imessage-exporter", "-l"]);
         assert!(Options::from_args(&args).is_err());
@@ -1024,6 +1132,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: true,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };

@@ -30,7 +30,8 @@ use crate::{
     Exporter, HTML, TXT, Timeline,
     app::{
         compatibility::attachment_manager::AttachmentManagerMode, contacts::Name,
-        data_source::DataSource, error::RuntimeError, export_type::ExportType, options::Options,
+        data_source::DataSource, error::RuntimeError, export_type::ExportType,
+        options::{OPTION_CONVERSATION_WITH, Options},
         sanitizers::sanitize_filename,
     },
     exporters::exporter::ATTACHMENT_NO_FILENAME,
@@ -269,18 +270,32 @@ impl Config {
     }
 
     // MARK: Filters
-    /// Convert comma separated list of participant strings into table chat IDs using
-    ///   1) filter `self.participants` values based on name matches with the user-provided filter strings
-    ///   2) get the chat IDs keys from `self.chatroom_participants` for values that contain the selected `handle_ids`
-    ///   3) send those chat and handle IDs to the query context so they are included in the message table filters
+    /// Convert participant filter strings into chat IDs and apply them to the
+    /// query context.
+    ///
+    /// Two filter modes are supported and unioned:
+    ///
+    /// 1. `--conversation-filter` / `-t`: loose-OR. A chat is selected if it
+    ///    contains at least one participant matching any of the comma-separated
+    ///    tokens.
+    /// 2. `--conversation-with` / `-w`: exact match. Each repeated value lists
+    ///    the comma-separated participants of one specific conversation; a chat
+    ///    is selected when its deduplicated non-self participant set equals the
+    ///    set the value resolves to. Multiple `-w` values are unioned.
     pub(crate) fn resolve_filtered_handles(&mut self) {
+        let has_filter = self.options.conversation_filter.is_some();
+        let has_with = !self.options.conversation_with.is_empty();
+        if !has_filter && !has_with {
+            return;
+        }
+
+        let mut included_chatrooms: BTreeSet<i32> = BTreeSet::new();
+        let mut included_handles: BTreeSet<i32> = BTreeSet::new();
+
+        // Loose-OR filter (`-t`)
         if let Some(conversation_filter) = &self.options.conversation_filter {
             let parsed_handle_filter = conversation_filter.split(',').collect::<Vec<&str>>();
 
-            let mut included_chatrooms: BTreeSet<i32> = BTreeSet::new();
-            let mut included_handles: BTreeSet<i32> = BTreeSet::new();
-
-            // First: Scan the list of participants for included handle IDs
             self.participants.iter().for_each(|(_, handle_name)| {
                 for included_name in &parsed_handle_filter {
                     if handle_name.contains(included_name) {
@@ -289,7 +304,6 @@ impl Config {
                 }
             });
 
-            // Second: scan the list of chatrooms for IDs that contain the selected participants
             self.chatroom_participants
                 .iter()
                 .for_each(|(chat_id, participants)| {
@@ -297,17 +311,100 @@ impl Config {
                         included_chatrooms.insert(*chat_id);
                     }
                 });
-
-            self.options
-                .query_context
-                .set_selected_handle_ids(included_handles);
-
-            self.options
-                .query_context
-                .set_selected_chat_ids(included_chatrooms);
-
-            self.log_filtered_handles_and_chats();
         }
+
+        // Exact-match filter (`-w`)
+        if has_with {
+            let exact_chats = self.resolve_exact_match_chats(&mut included_handles);
+            included_chatrooms.extend(exact_chats);
+        }
+
+        self.options
+            .query_context
+            .set_selected_handle_ids(included_handles);
+
+        self.options
+            .query_context
+            .set_selected_chat_ids(included_chatrooms);
+
+        self.log_filtered_handles_and_chats();
+    }
+
+    /// Resolve every `--conversation-with` group to the chat IDs whose
+    /// deduplicated non-self participant set matches the group exactly.
+    ///
+    /// As a side effect, every raw handle id of every resolved participant is
+    /// added to `included_handles` so diagnostic logging in
+    /// [`Config::log_filtered_handles_and_chats`] reflects the full filter.
+    fn resolve_exact_match_chats(&self, included_handles: &mut BTreeSet<i32>) -> BTreeSet<i32> {
+        let mut included: BTreeSet<i32> = BTreeSet::new();
+
+        for group_str in &self.options.conversation_with {
+            let tokens: Vec<&str> = group_str
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if tokens.is_empty() {
+                continue;
+            }
+
+            // Resolve each token to the set of deduped participant ids whose
+            // Name contains the token. Track raw handle ids so we can also
+            // surface them through `included_handles` for diagnostic logging.
+            let mut resolved_deduped: BTreeSet<i32> = BTreeSet::new();
+            let mut all_raw_handles: Vec<i32> = Vec::new();
+            let mut any_token_unresolved = false;
+
+            for token in &tokens {
+                let mut token_matches: Vec<(i32, &Name)> = Vec::new();
+                for (deduped_id, name) in &self.participants {
+                    if name.contains(token) {
+                        token_matches.push((*deduped_id, name));
+                    }
+                }
+                if token_matches.is_empty() {
+                    eprintln!(
+                        "Warning: --{OPTION_CONVERSATION_WITH} token `{token}` did not match any participant",
+                    );
+                    any_token_unresolved = true;
+                    continue;
+                }
+                if token_matches.len() > 1 {
+                    eprintln!(
+                        "Warning: --{OPTION_CONVERSATION_WITH} token `{token}` matched {} participants; treating them as a combined participant set",
+                        token_matches.len()
+                    );
+                }
+                for (deduped_id, name) in token_matches {
+                    resolved_deduped.insert(deduped_id);
+                    all_raw_handles.extend(&name.handle_ids);
+                }
+            }
+
+            // If any token failed to resolve, the user's intent for this
+            // group is ambiguous — skip the whole group rather than match a
+            // smaller set than they asked for.
+            if any_token_unresolved || resolved_deduped.is_empty() {
+                continue;
+            }
+
+            for (chat_id, raw_participants) in &self.chatroom_participants {
+                let chat_deduped: BTreeSet<i32> = raw_participants
+                    .iter()
+                    // Exclude handle 0 ("Me") since `-w` describes the
+                    // *other* participants of the conversation.
+                    .filter(|h| **h != 0)
+                    .filter_map(|h| self.real_participants.get(h).copied())
+                    .collect();
+
+                if chat_deduped == resolved_deduped {
+                    included.insert(*chat_id);
+                    included_handles.extend(&all_raw_handles);
+                }
+            }
+        }
+        included
     }
 
     /// If we set some filtered chatrooms, emit how many will be included in the export
@@ -1247,6 +1344,268 @@ mod directory_tests {
         let result = app.message_attachment_path(&attachment);
         let expected = String::from("a/b/c/d.jpg");
         assert_eq!(result, expected);
+    }
+}
+
+#[cfg(test)]
+mod conversation_with_tests {
+    use std::collections::BTreeSet;
+
+    use crate::{
+        Config, Options,
+        app::{contacts::Name, export_type::ExportType},
+    };
+
+    /// Set up an app with three deduplicated participants and a fixed set of
+    /// chatrooms used across the exact-match tests:
+    ///
+    /// - Chat 1: DM with Alice (handles {10})
+    /// - Chat 2: Group with Alice + Bob (handles {10, 11})
+    /// - Chat 3: DM with Bob (handles {11})
+    /// - Chat 4: Group with Alice + Bob + Charlie (handles {10, 11, 12})
+    ///
+    /// Each participant's deduped id equals their raw handle id, which keeps
+    /// the test setup simple. The dedup-specific test below sets up its own
+    /// app where one person has two raw handles.
+    fn fixture_with_three_people() -> Config {
+        let options = Options::fake_options(ExportType::Html);
+        let mut app = Config::fake_app(options);
+
+        for (id, name) in [(10, "Alice"), (11, "Bob"), (12, "Charlie")] {
+            app.participants.insert(id, Name::fake_name(name));
+            app.real_participants.insert(id, id);
+        }
+        for (id, p) in app.participants.iter_mut() {
+            p.handle_ids.insert(*id);
+        }
+
+        let mut chat_1 = BTreeSet::new();
+        chat_1.insert(10);
+        app.chatroom_participants.insert(1, chat_1);
+
+        let mut chat_2 = BTreeSet::new();
+        chat_2.insert(10);
+        chat_2.insert(11);
+        app.chatroom_participants.insert(2, chat_2);
+
+        let mut chat_3 = BTreeSet::new();
+        chat_3.insert(11);
+        app.chatroom_participants.insert(3, chat_3);
+
+        let mut chat_4 = BTreeSet::new();
+        chat_4.insert(10);
+        chat_4.insert(11);
+        chat_4.insert(12);
+        app.chatroom_participants.insert(4, chat_4);
+
+        app
+    }
+
+    #[test]
+    fn dm_exact_match_picks_only_the_dm() {
+        let mut app = fixture_with_three_people();
+        app.options.conversation_with = vec![String::from("Alice")];
+        app.resolve_filtered_handles();
+
+        // Only chat 1 (the Alice DM) should match — not the alice+bob group
+        // and not the alice+bob+charlie group.
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([1]))
+        );
+    }
+
+    #[test]
+    fn group_exact_match_requires_full_set_no_subset_or_superset() {
+        let mut app = fixture_with_three_people();
+        app.options.conversation_with = vec![String::from("Alice,Bob")];
+        app.resolve_filtered_handles();
+
+        // Only chat 2 matches: chat 1 is missing Bob, chat 4 has an extra
+        // participant (Charlie), and chat 3 is missing Alice.
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([2]))
+        );
+    }
+
+    #[test]
+    fn group_exact_match_three_people() {
+        let mut app = fixture_with_three_people();
+        app.options.conversation_with = vec![String::from("Alice,Bob,Charlie")];
+        app.resolve_filtered_handles();
+
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([4]))
+        );
+    }
+
+    #[test]
+    fn token_order_does_not_matter() {
+        let mut app = fixture_with_three_people();
+        app.options.conversation_with = vec![String::from("Bob,Alice")];
+        app.resolve_filtered_handles();
+
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([2]))
+        );
+    }
+
+    #[test]
+    fn whitespace_around_tokens_is_ignored() {
+        let mut app = fixture_with_three_people();
+        app.options.conversation_with = vec![String::from(" Alice ,  Bob ")];
+        app.resolve_filtered_handles();
+
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([2]))
+        );
+    }
+
+    #[test]
+    fn multiple_conversation_with_flags_union_results() {
+        let mut app = fixture_with_three_people();
+        app.options.conversation_with = vec![
+            // Alice DM
+            String::from("Alice"),
+            // Alice + Bob group
+            String::from("Alice,Bob"),
+        ];
+        app.resolve_filtered_handles();
+
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([1, 2]))
+        );
+    }
+
+    #[test]
+    fn unknown_token_yields_empty_selection() {
+        let mut app = fixture_with_three_people();
+        app.options.conversation_with = vec![String::from("DoesNotExist")];
+        app.resolve_filtered_handles();
+
+        // No matches → we expect no chat ids selected at all (None when the
+        // set is empty per QueryContext::set_selected_chat_ids semantics).
+        assert!(
+            app.options
+                .query_context
+                .selected_chat_ids
+                .as_ref()
+                .map_or(true, BTreeSet::is_empty)
+        );
+    }
+
+    #[test]
+    fn empty_group_string_is_ignored() {
+        let mut app = fixture_with_three_people();
+        // Empty string and all-whitespace string should both be silently
+        // ignored rather than matching a degenerate chat.
+        app.options.conversation_with =
+            vec![String::new(), String::from("  ,  "), String::from("Alice")];
+        app.resolve_filtered_handles();
+
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([1]))
+        );
+    }
+
+    #[test]
+    fn combined_with_conversation_filter_unions_loose_or_with_exact_match() {
+        let mut app = fixture_with_three_people();
+        // Loose-OR filter: any chat with Charlie (i.e. just chat 4)
+        app.options.conversation_filter = Some(String::from("Charlie"));
+        // Exact match: alice DM (chat 1) and alice+bob group (chat 2)
+        app.options.conversation_with =
+            vec![String::from("Alice"), String::from("Alice,Bob")];
+
+        app.resolve_filtered_handles();
+
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([1, 2, 4]))
+        );
+    }
+
+    #[test]
+    fn deduplicated_handles_treated_as_one_person_in_exact_match() {
+        // Alice has two raw handles (phone + email) that map to the same
+        // deduplicated person id (10). One chat references only her email
+        // handle, the other references only her phone. Both should match
+        // `-w Alice`.
+        let options = Options::fake_options(ExportType::Html);
+        let mut app = Config::fake_app(options);
+
+        let mut alice = Name::fake_name("Alice");
+        alice.handle_ids.insert(10);
+        alice.handle_ids.insert(100);
+        app.participants.insert(10, alice);
+
+        // Both raw handle IDs collapse to deduped id 10.
+        app.real_participants.insert(10, 10);
+        app.real_participants.insert(100, 10);
+
+        // Chat 1: alice via phone handle (10) only - DM
+        let mut chat_1 = BTreeSet::new();
+        chat_1.insert(10);
+        app.chatroom_participants.insert(1, chat_1);
+
+        // Chat 2: alice via email handle (100) only - DM
+        let mut chat_2 = BTreeSet::new();
+        chat_2.insert(100);
+        app.chatroom_participants.insert(2, chat_2);
+
+        // Chat 3: alice via both raw handles (rare but representable) - DM
+        let mut chat_3 = BTreeSet::new();
+        chat_3.insert(10);
+        chat_3.insert(100);
+        app.chatroom_participants.insert(3, chat_3);
+
+        app.options.conversation_with = vec![String::from("Alice")];
+        app.resolve_filtered_handles();
+
+        // All three chats are 1-on-1 DMs with Alice once handles are deduped.
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn exact_match_excludes_self_handle_zero() {
+        // Some chats include handle id 0 (the user themselves). The exact
+        // match should ignore handle 0 when comparing against the user's
+        // requested participant list, since `-w` describes the *other*
+        // participants of the conversation.
+        let options = Options::fake_options(ExportType::Html);
+        let mut app = Config::fake_app(options);
+
+        app.participants.insert(10, Name::fake_name("Alice"));
+        app.real_participants.insert(10, 10);
+        for (id, p) in app.participants.iter_mut() {
+            p.handle_ids.insert(*id);
+        }
+        // Handle 0 (Me) is not a user-visible participant in normal exports;
+        // for this test we don't list it in `participants` but we DO put it
+        // in the chat's handle set to mirror older databases that do.
+        app.real_participants.insert(0, 0);
+
+        let mut chat_1 = BTreeSet::new();
+        chat_1.insert(0); // self
+        chat_1.insert(10); // alice
+        app.chatroom_participants.insert(1, chat_1);
+
+        app.options.conversation_with = vec![String::from("Alice")];
+        app.resolve_filtered_handles();
+
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([1]))
+        );
     }
 }
 
