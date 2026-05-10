@@ -28,7 +28,7 @@ use imessage_database::{
         chat::Chat,
         messages::{
             Message,
-            models::{BubbleComponent, GroupAction},
+            models::{BubbleComponent, GroupAction, TextAttributes},
         },
         table::{ME, ORPHANED, Table, UNKNOWN, YOU},
     },
@@ -74,6 +74,11 @@ pub struct Timeline<'a> {
     pub file: BufWriter<File>,
     /// Messages collected and grouped by day (BTreeMap so days come out in
     /// chronological order) then by thread.
+    ///
+    /// TODO: this buffers every formatted block until iteration finishes.
+    /// For very large databases that's a lot of RAM; a streaming pass
+    /// (sort by local-day at the SQL layer, flush per-day) would scale
+    /// better.
     grouped: BTreeMap<NaiveDate, HashMap<ThreadKey, ThreadEntry>>,
     /// Progress bar model
     pb: ExportProgress,
@@ -312,9 +317,10 @@ impl<'a> Timeline<'a> {
         // for the v1 timeline view.
         for component in &msg.components {
             match component {
-                BubbleComponent::Text(_) => {
+                BubbleComponent::Text(text_attrs) => {
                     if let Some(text) = &msg.text {
-                        let trimmed = text.trim();
+                        let slice = slice_text_for_bubble(text, text_attrs);
+                        let trimmed = slice.trim();
                         if !trimmed.is_empty() {
                             let _ = writeln!(out, "{trimmed}");
                             out.push('\n');
@@ -369,12 +375,19 @@ impl<'a> Timeline<'a> {
         }
 
         // Tapbacks (reactions): show inline under the message if present.
+        // Iterate component indices in sorted order so output is deterministic
+        // — `tapbacks_map` is a HashMap, which would otherwise yield a
+        // run-to-run ordering.
         if let Some(tapbacks_map) = self.config.tapbacks.get(&msg.guid) {
+            let mut tapback_keys: Vec<usize> = tapbacks_map.keys().copied().collect();
+            tapback_keys.sort_unstable();
             let mut lines: Vec<String> = Vec::new();
-            for tapbacks in tapbacks_map.values() {
-                for tb in tapbacks {
-                    if let Some(line) = self.format_tapback_line(tb) {
-                        lines.push(line);
+            for k in tapback_keys {
+                if let Some(tapbacks) = tapbacks_map.get(&k) {
+                    for tb in tapbacks {
+                        if let Some(line) = self.format_tapback_line(tb) {
+                            lines.push(line);
+                        }
                     }
                 }
             }
@@ -460,7 +473,7 @@ impl<'a> Timeline<'a> {
                         format!("{verb} {resolved} {prep} the conversation.")
                     }
                     GroupAction::NameChange(name) => {
-                        format!("renamed the conversation to {name}")
+                        format!("renamed the conversation to {name}.")
                     }
                     GroupAction::ParticipantLeft => "left the conversation.".to_string(),
                     GroupAction::GroupIconChanged => "changed the group photo.".to_string(),
@@ -477,7 +490,7 @@ impl<'a> Timeline<'a> {
                 },
                 Announcement::AudioMessageKept => "kept an audio message.".to_string(),
                 Announcement::FullyUnsent => "unsent a message!".to_string(),
-                Announcement::Unknown(num) => format!("performed unknown action {num}"),
+                Announcement::Unknown(num) => format!("performed unknown action {num}."),
             },
             None => "(unable to format announcement)".to_string(),
         };
@@ -487,13 +500,11 @@ impl<'a> Timeline<'a> {
 }
 
 // MARK: Free helpers
-/// Format a `DateTime<Local>` as "5:29:42 PM" (matches the time portion of
-/// the existing `dates::format` style: `%l:%M:%S %p`).
+/// Format a `DateTime<Local>` as "5:29:42 PM". Uses `%-l` (unpadded
+/// 12-hour) so we don't need to trim a leading space the way the
+/// `imessage_database::util::dates::format` helper would.
 pub(crate) fn format_time(date: &DateTime<Local>) -> String {
-    DateTime::format(date, "%l:%M:%S %p")
-        .to_string()
-        .trim_start()
-        .to_string()
+    date.format("%-l:%M:%S %p").to_string()
 }
 
 /// Build the H1 day header, e.g. "# Saturday, March 21, 2026\n\n".
@@ -530,6 +541,27 @@ pub(crate) fn format_day_header(date: &NaiveDate) -> String {
 /// Build the H2 thread header for a single thread on a single day.
 pub(crate) fn format_thread_header(name: &str) -> String {
     format!("## {name}\n\n")
+}
+
+/// Concatenate just the slices of `text` belonging to a single Text bubble's
+/// attributes. Without this, multi-bubble messages render the full message
+/// body once per Text bubble. Mirrors `TXT::format_attributes` (de-dupes
+/// adjacent runs with the same range and ignores out-of-range attributes).
+fn slice_text_for_bubble(text: &str, attributes: &[TextAttributes]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_start = 0;
+    let mut prev_end = 0;
+    for effect in attributes {
+        if prev_start == effect.start && prev_end == effect.end {
+            continue;
+        }
+        if let Some(piece) = text.get(effect.start..effect.end) {
+            prev_start = effect.start;
+            prev_end = effect.end;
+            out.push_str(piece);
+        }
+    }
+    out
 }
 
 /// Prefix every line of `text` with `> ` for a Markdown blockquote.
@@ -590,7 +622,14 @@ mod tests {
         app::{contacts::Name, export_type::ExportType},
     };
     use chrono::NaiveDate;
-    use imessage_database::tables::{chat::Chat, table::ME};
+    use imessage_database::{
+        message_types::text_effects::TextEffect,
+        tables::{
+            chat::Chat,
+            messages::models::{BubbleComponent, TextAttributes},
+            table::ME,
+        },
+    };
 
     fn fake_chat() -> Chat {
         Chat {
@@ -637,9 +676,7 @@ mod tests {
 
     #[test]
     fn can_create_timeline_exporter() {
-        let _ = std::fs::remove_file("/tmp/timeline.md");
-        let options = Options::fake_options(ExportType::Timeline);
-        let config = Config::fake_app(options);
+        let config = Config::fake_app(isolated_options("can_create_timeline_exporter"));
         let exporter = Timeline::new(&config).unwrap();
         // No grouped data and no orphaned messages have been seen yet.
         assert!(exporter.grouped.is_empty());
@@ -667,9 +704,7 @@ mod tests {
 
     #[test]
     fn format_timeline_message_basic_from_me() {
-        let _ = std::fs::remove_file("/tmp/timeline.md");
-        let options = Options::fake_options(ExportType::Timeline);
-        let config = Config::fake_app(options);
+        let config = Config::fake_app(isolated_options("format_timeline_message_basic_from_me"));
         let exporter = Timeline::new(&config).unwrap();
 
         let mut message = Config::fake_message();
@@ -689,9 +724,8 @@ mod tests {
 
     #[test]
     fn format_timeline_message_basic_from_them() {
-        let _ = std::fs::remove_file("/tmp/timeline.md");
-        let options = Options::fake_options(ExportType::Timeline);
-        let mut config = Config::fake_app(options);
+        let mut config =
+            Config::fake_app(isolated_options("format_timeline_message_basic_from_them"));
         config
             .participants
             .insert(999_999, Name::fake_name("Sample Contact"));
@@ -712,10 +746,60 @@ mod tests {
     }
 
     #[test]
+    fn slice_text_for_bubble_returns_only_the_attribute_range() {
+        let attrs = vec![TextAttributes::new(6, 11, vec![TextEffect::Default])];
+        assert_eq!(slice_text_for_bubble("Hello world", &attrs), "world");
+    }
+
+    #[test]
+    fn slice_text_for_bubble_dedupes_consecutive_identical_ranges() {
+        // The typedstream parser sometimes emits multiple adjacent attribute
+        // entries with the same byte range. We should render the slice once.
+        let attrs = vec![
+            TextAttributes::new(0, 5, vec![TextEffect::Default]),
+            TextAttributes::new(0, 5, vec![TextEffect::Default]),
+        ];
+        assert_eq!(slice_text_for_bubble("Hello world", &attrs), "Hello");
+    }
+
+    #[test]
+    fn multi_text_bubble_message_does_not_duplicate_text() {
+        // Reproduces the bug where a message split into multiple Text bubbles
+        // (e.g. mention + plain text) would render the entire `msg.text`
+        // body once per Text bubble.
+        let config =
+            Config::fake_app(isolated_options("multi_text_bubble_message_does_not_duplicate_text"));
+        let exporter = Timeline::new(&config).unwrap();
+
+        let mut message = Config::fake_message();
+        message.date = 674526582885055488;
+        message.text = Some("Hi Alice, how are you?".to_string());
+        message.is_from_me = true;
+        // Two text bubbles: "Hi Alice" + ", how are you?"
+        message.components = vec![
+            BubbleComponent::Text(vec![TextAttributes::new(
+                0,
+                8,
+                vec![TextEffect::Default],
+            )]),
+            BubbleComponent::Text(vec![TextAttributes::new(
+                8,
+                22,
+                vec![TextEffect::Default],
+            )]),
+        ];
+
+        let actual = exporter.format_timeline_message(&message).unwrap();
+        // Each bubble's slice appears once and on its own line.
+        let expected =
+            "**5:29:42 PM — Me**\n\nHi Alice\n\n, how are you?\n\n";
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn format_announcement_renames_conversation() {
-        let _ = std::fs::remove_file("/tmp/timeline.md");
-        let options = Options::fake_options(ExportType::Timeline);
-        let mut config = Config::fake_app(options);
+        let mut config =
+            Config::fake_app(isolated_options("format_announcement_renames_conversation"));
         config.participants.insert(0, Name::fake_name(ME));
         let exporter = Timeline::new(&config).unwrap();
 
@@ -726,15 +810,14 @@ mod tests {
         message.item_type = 2;
 
         let actual = exporter.format_announcement(&message);
-        let expected = "*5:29:42 PM — You renamed the conversation to Hello world*\n\n";
+        let expected = "*5:29:42 PM — You renamed the conversation to Hello world.*\n\n";
         assert_eq!(actual, expected);
     }
 
     #[test]
     fn collect_message_groups_by_day_and_thread() {
-        let _ = std::fs::remove_file("/tmp/timeline.md");
-        let options = Options::fake_options(ExportType::Timeline);
-        let mut config = Config::fake_app(options);
+        let mut config =
+            Config::fake_app(isolated_options("collect_message_groups_by_day_and_thread"));
         // Provide a chat so messages with chat_id=0 resolve to a thread.
         config.chatrooms.insert(0, fake_chat());
         config.real_chatrooms.insert(0, 0);
@@ -939,5 +1022,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Build `Options` whose `export_path` is a tempdir unique to the test, so
+    /// parallel tests don't race on a shared `/tmp/timeline.md`.
+    fn isolated_options(test_name: &str) -> Options {
+        let mut options = Options::fake_options(ExportType::Timeline);
+        options.export_path = tempdir_for_test(test_name);
+        options
     }
 }
