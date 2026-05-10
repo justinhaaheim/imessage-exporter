@@ -618,25 +618,28 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_export_html() {
-        // Cleanup existing temp data
-        let _ = fs::remove_file("/tmp/orphaned.html");
+        // Use an isolated tempdir so unrelated leftover files in /tmp can't
+        // trip `validate_path`'s same-extension check.
+        let dir = std::env::temp_dir().join("imessage_path_test_can_build_option_export_html");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
 
         // Get matches from sample args
         let command = get_command();
-        let args = command.get_matches_from(["imessage-exporter", "-f", "html", "-o", "/tmp"]);
+        let args = command.get_matches_from(["imessage-exporter", "-f", "html", "-o", &dir_str]);
 
         // Build the Options
         let actual = Options::from_args(&args).unwrap();
 
         // Expected data
-        let tmp_dir = String::from("/tmp");
         let expected = Options {
             db_path: default_db_path(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: false,
             export_type: Some(ExportType::Html),
-            export_path: validate_path(Some(&tmp_dir), None).unwrap(),
+            export_path: validate_path(Some(&dir_str), None).unwrap(),
             query_context: QueryContext::default(),
             no_lazy: false,
             custom_name: None,
@@ -654,9 +657,6 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_export_txt_no_lazy() {
-        // Cleanup existing temp data
-        let _ = fs::remove_file("/tmp/orphaned.txt");
-
         // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-f", "txt", "-l"]);
@@ -1165,58 +1165,56 @@ mod path_tests {
     };
     use imessage_database::util::dirs::home;
 
+    /// Build a fresh, empty tempdir unique to the calling test so parallel
+    /// runs do not race on `/tmp` and unrelated leftover files from prior
+    /// runs cannot trip `validate_path`'s same-extension check.
+    fn tempdir_for_test(test_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("imessage_path_test_{test_name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn can_validate_empty() {
-        // Cleanup existing temp data
-        let _ = fs::remove_file("/tmp/orphaned.txt");
-
-        let tmp = String::from("/tmp");
-        let export_path = Some(&tmp);
+        let dir = tempdir_for_test("can_validate_empty");
+        let dir_str = dir.to_string_lossy().into_owned();
         let export_type = Some(ExportType::Txt);
 
-        let result = validate_path(export_path, export_type.as_ref());
+        let result = validate_path(Some(&dir_str), export_type.as_ref());
 
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp"));
+        assert_eq!(result.unwrap(), dir);
     }
 
     #[test]
     fn can_validate_different_type() {
-        // Cleanup existing temp data
-        let _ = fs::remove_file("/tmp/orphaned.txt");
-
-        let tmp = String::from("/tmp");
-        let export_path = Some(&tmp);
-        let export_type = Some(ExportType::Txt);
-
-        let result = validate_path(export_path, export_type.as_ref());
-
-        let mut tmp = PathBuf::from("/tmp");
-        tmp.push("fake1.html");
-        let mut file = fs::File::create(&tmp).unwrap();
+        let dir = tempdir_for_test("can_validate_different_type");
+        // A pre-existing file of a *different* extension must not trip the
+        // same-type check.
+        let mut other_ext = dir.clone();
+        other_ext.push("fake1.html");
+        let mut file = fs::File::create(&other_ext).unwrap();
         file.write_all(&[]).unwrap();
 
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp"));
-        fs::remove_file(&tmp).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
+        let result = validate_path(Some(&dir_str), Some(&ExportType::Txt));
+
+        assert_eq!(result.unwrap(), dir);
     }
 
     #[test]
     fn can_validate_same_type() {
-        // Cleanup existing temp data
-        let _ = fs::remove_file("/tmp/orphaned.txt");
-
-        let tmp = String::from("/tmp");
-        let export_path = Some(&tmp);
-        let export_type = Some(ExportType::Txt);
-
-        let result = validate_path(export_path, export_type.as_ref());
-
-        let mut tmp = PathBuf::from("/tmp");
-        tmp.push("fake2.txt");
-        let mut file = fs::File::create(&tmp).unwrap();
+        let dir = tempdir_for_test("can_validate_same_type");
+        // A pre-existing file of the *same* extension must trip the check.
+        let mut same_ext = dir.clone();
+        same_ext.push("fake2.txt");
+        let mut file = fs::File::create(&same_ext).unwrap();
         file.write_all(&[]).unwrap();
 
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp"));
-        fs::remove_file(&tmp).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
+        let result = validate_path(Some(&dir_str), Some(&ExportType::Txt));
+
+        assert!(result.is_err(), "expected error, got: {:?}", result);
     }
 
     #[test]
