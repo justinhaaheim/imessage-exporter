@@ -31,7 +31,7 @@ use crate::{
     app::{
         compatibility::attachment_manager::AttachmentManagerMode, contacts::Name,
         data_source::DataSource, error::RuntimeError, export_type::ExportType,
-        options::{OPTION_CONVERSATION_WITH, Options},
+        options::{OPTION_CONVERSATION_FILTER, OPTION_CONVERSATION_WITH, Options},
         sanitizers::sanitize_filename,
     },
     exporters::exporter::ATTACHMENT_NO_FILENAME,
@@ -282,11 +282,15 @@ impl Config {
     ///    the comma-separated participants of one specific conversation; a chat
     ///    is selected when its deduplicated non-self participant set equals the
     ///    set the value resolves to. Multiple `-w` values are unioned.
-    pub(crate) fn resolve_filtered_handles(&mut self) {
+    ///
+    /// Returns an error when the user supplied a filter but it resolved to
+    /// zero chats — otherwise an empty `selected_chat_ids` set would be
+    /// indistinguishable from "no filter" and silently export everything.
+    pub(crate) fn resolve_filtered_handles(&mut self) -> Result<(), RuntimeError> {
         let has_filter = self.options.conversation_filter.is_some();
         let has_with = !self.options.conversation_with.is_empty();
         if !has_filter && !has_with {
-            return;
+            return Ok(());
         }
 
         let mut included_chatrooms: BTreeSet<i32> = BTreeSet::new();
@@ -319,6 +323,12 @@ impl Config {
             included_chatrooms.extend(exact_chats);
         }
 
+        if included_chatrooms.is_empty() {
+            return Err(RuntimeError::InvalidOptions(format!(
+                "No chats matched the supplied --{OPTION_CONVERSATION_FILTER}/--{OPTION_CONVERSATION_WITH} filter; nothing would be exported"
+            )));
+        }
+
         self.options
             .query_context
             .set_selected_handle_ids(included_handles);
@@ -328,6 +338,7 @@ impl Config {
             .set_selected_chat_ids(included_chatrooms);
 
         self.log_filtered_handles_and_chats();
+        Ok(())
     }
 
     /// Resolve every `--conversation-with` group to the chat IDs whose
@@ -1405,7 +1416,7 @@ mod conversation_with_tests {
     fn dm_exact_match_picks_only_the_dm() {
         let mut app = fixture_with_three_people();
         app.options.conversation_with = vec![String::from("Alice")];
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
 
         // Only chat 1 (the Alice DM) should match — not the alice+bob group
         // and not the alice+bob+charlie group.
@@ -1419,7 +1430,7 @@ mod conversation_with_tests {
     fn group_exact_match_requires_full_set_no_subset_or_superset() {
         let mut app = fixture_with_three_people();
         app.options.conversation_with = vec![String::from("Alice,Bob")];
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
 
         // Only chat 2 matches: chat 1 is missing Bob, chat 4 has an extra
         // participant (Charlie), and chat 3 is missing Alice.
@@ -1433,7 +1444,7 @@ mod conversation_with_tests {
     fn group_exact_match_three_people() {
         let mut app = fixture_with_three_people();
         app.options.conversation_with = vec![String::from("Alice,Bob,Charlie")];
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
 
         assert_eq!(
             app.options.query_context.selected_chat_ids,
@@ -1445,7 +1456,7 @@ mod conversation_with_tests {
     fn token_order_does_not_matter() {
         let mut app = fixture_with_three_people();
         app.options.conversation_with = vec![String::from("Bob,Alice")];
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
 
         assert_eq!(
             app.options.query_context.selected_chat_ids,
@@ -1457,7 +1468,7 @@ mod conversation_with_tests {
     fn whitespace_around_tokens_is_ignored() {
         let mut app = fixture_with_three_people();
         app.options.conversation_with = vec![String::from(" Alice ,  Bob ")];
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
 
         assert_eq!(
             app.options.query_context.selected_chat_ids,
@@ -1474,7 +1485,7 @@ mod conversation_with_tests {
             // Alice + Bob group
             String::from("Alice,Bob"),
         ];
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
 
         assert_eq!(
             app.options.query_context.selected_chat_ids,
@@ -1483,20 +1494,21 @@ mod conversation_with_tests {
     }
 
     #[test]
-    fn unknown_token_yields_empty_selection() {
+    fn unknown_token_errors_instead_of_silently_exporting_everything() {
+        // Empty resolution must hard-error so a typo like `-w foo` doesn't
+        // fall back to "no filter" and silently export the whole database.
         let mut app = fixture_with_three_people();
         app.options.conversation_with = vec![String::from("DoesNotExist")];
-        app.resolve_filtered_handles();
+        assert!(app.resolve_filtered_handles().is_err());
+        assert!(app.options.query_context.selected_chat_ids.is_none());
+    }
 
-        // No matches → we expect no chat ids selected at all (None when the
-        // set is empty per QueryContext::set_selected_chat_ids semantics).
-        assert!(
-            app.options
-                .query_context
-                .selected_chat_ids
-                .as_ref()
-                .map_or(true, BTreeSet::is_empty)
-        );
+    #[test]
+    fn unknown_t_token_errors_instead_of_silently_exporting_everything() {
+        let mut app = fixture_with_three_people();
+        app.options.conversation_filter = Some(String::from("DoesNotExist"));
+        assert!(app.resolve_filtered_handles().is_err());
+        assert!(app.options.query_context.selected_chat_ids.is_none());
     }
 
     #[test]
@@ -1506,7 +1518,7 @@ mod conversation_with_tests {
         // ignored rather than matching a degenerate chat.
         app.options.conversation_with =
             vec![String::new(), String::from("  ,  "), String::from("Alice")];
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
 
         assert_eq!(
             app.options.query_context.selected_chat_ids,
@@ -1523,7 +1535,7 @@ mod conversation_with_tests {
         app.options.conversation_with =
             vec![String::from("Alice"), String::from("Alice,Bob")];
 
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
 
         assert_eq!(
             app.options.query_context.selected_chat_ids,
@@ -1566,7 +1578,7 @@ mod conversation_with_tests {
         app.chatroom_participants.insert(3, chat_3);
 
         app.options.conversation_with = vec![String::from("Alice")];
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
 
         // All three chats are 1-on-1 DMs with Alice once handles are deduped.
         assert_eq!(
@@ -1600,7 +1612,7 @@ mod conversation_with_tests {
         app.chatroom_participants.insert(1, chat_1);
 
         app.options.conversation_with = vec![String::from("Alice")];
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
 
         assert_eq!(
             app.options.query_context.selected_chat_ids,
@@ -1668,7 +1680,7 @@ mod chat_filter_tests {
         chatroom_6.insert(13); // Even though this person is excluded, the above person is
         app.chatroom_participants.insert(6, chatroom_6);
 
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
         // For the test, sort the output so it is always the same
 
         assert_eq!(
@@ -1731,7 +1743,7 @@ mod chat_filter_tests {
         chatroom_6.insert(13); // Even though this person is excluded, the above person is
         app.chatroom_participants.insert(6, chatroom_6);
 
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
         // For the test, sort the output so it is always the same
 
         assert_eq!(
