@@ -1,0 +1,17 @@
+{
+  "sandbox": {
+    "excludedCommands": ["br"]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun run \"$CLAUDE_PROJECT_DIR/scripts/setup-env.ts\""
+          }
+        ]
+      }
+    ]
+  }
+}

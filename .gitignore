@@ -153,3 +153,12 @@ projects/*
 .DS_Store
 
 
+
+# justin-sdk baseline (appended)
+build/
+coverage/
+*.tsbuildinfo
+.env
+.env.local
+.beads/.br_recovery/
+.beads/.local_version
