@@ -1,15 +1,15 @@
 /*!
- Contains data structures used to describe export types.
+ Export format selection.
 */
 
 use std::fmt::Display;
 
-/// Represents the type of file to export iMessage data into
+/// Export file format.
 #[derive(PartialEq, Eq, Debug)]
 pub enum ExportType {
-    /// HTML file export
+    /// HTML export.
     Html,
-    /// Text file export
+    /// Plain text export.
     Txt,
     /// Unified Markdown timeline: a single `.md` file that groups every message
     /// across all threads by day, then by conversation thread within that day
@@ -17,7 +17,7 @@ pub enum ExportType {
 }
 
 impl ExportType {
-    /// Given user's input, return a variant if the input matches one
+    /// Parse an export format from CLI input.
     pub fn from_cli(format: &str) -> Option<Self> {
         match format.to_lowercase().as_str() {
             "txt" => Some(Self::Txt),
@@ -27,7 +27,7 @@ impl ExportType {
         }
     }
 
-    /// Get the file name extension for the given export type
+    /// Return the file extension for this export format.
     pub fn extension(&self) -> &str {
         match self {
             ExportType::Html => ".html",

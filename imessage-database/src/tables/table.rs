@@ -1,9 +1,10 @@
 /*!
- This module defines traits for table representations and stores some shared table constants.
+ Table traits, database connection helpers, and shared table constants.
 
- # Zero-Allocation Streaming API
+ # Streaming API
 
- This module provides zero-allocation streaming capabilities for all database tables through a callback-based API.
+ The streaming API processes each row through a callback without collecting the
+ table into a `Vec`.
 
  ```no_run
  use imessage_database::{
@@ -27,38 +28,66 @@
  }).unwrap();
  ```
 
- Note: you can substitute `TableError` with your own error type if it implements `From<TableError>`. See the [`Table::stream`] method for more details.
+ The callback may return any error type that implements `From<TableError>`.
 */
 
 use std::{collections::HashMap, fs::metadata, path::Path};
 
-use rusqlite::{CachedStatement, Connection, Error, OpenFlags, Result, Row, blob::Blob};
+use rusqlite::{
+    CachedStatement, Connection, Error, OpenFlags, Params, Result, Row, Statement, blob::Blob,
+};
 
 use crate::error::table::{TableConnectError, TableError};
 
 // MARK: Traits
-/// Defines behavior for SQL Table data
+/// Database table model that can deserialize itself from SQLite rows.
 pub trait Table: Sized {
-    /// Deserialize a single row into Self, returning a [`rusqlite::Result`]
+    /// Deserialize a single row into `Self`. Returns [`rusqlite::Result`]
+    /// for direct use inside `rusqlite::query_map` / `query_row`
+    /// callbacks. For high-level iteration, prefer [`Table::rows`] or
+    /// [`Table::row`].
     fn from_row(row: &Row) -> Result<Self>;
 
-    /// Prepare SELECT * statement
+    /// Prepare the table's default `SELECT *` statement.
     fn get(db: &'_ Connection) -> Result<CachedStatement<'_>, TableError>;
 
-    /// Map a `rusqlite::Result<Self>` into our `TableError`
-    fn extract(item: Result<Result<Self, Error>, Error>) -> Result<Self, TableError> {
-        match item {
-            Ok(Ok(row)) => Ok(row),
-            Err(why) | Ok(Err(why)) => Err(TableError::QueryError(why)),
-        }
+    /// Iterate over rows produced by `stmt`, deserializing each via
+    /// [`from_row`](Self::from_row). Errors at row-fetch or row-deserialize
+    /// time are surfaced uniformly as [`TableError`]. Accepts both
+    /// [`rusqlite::Statement`] and [`rusqlite::CachedStatement`] (the
+    /// latter via deref coercion).
+    ///
+    /// Use this when the caller owns a custom prepared statement (with
+    /// filters, joins, or bound parameters). For a full-table scan against
+    /// the default `SELECT *` with a callback API, see [`Table::stream`].
+    fn rows<'stmt, P: Params>(
+        stmt: &'stmt mut Statement<'_>,
+        params: P,
+    ) -> Result<impl Iterator<Item = Result<Self, TableError>> + 'stmt, TableError>
+    where
+        Self: 'stmt,
+    {
+        let mapped = stmt.query_map(params, |row| Ok(Self::from_row(row)))?;
+        Ok(mapped.map(flatten_row))
     }
 
-    /// Process all rows from the table using a callback.
-    /// This is the most memory-efficient approach for large tables.
+    /// Fetch exactly one row from `stmt`. Returns
+    /// [`TableError::QueryError`] if the row is missing or fails to
+    /// deserialize. Accepts both [`rusqlite::Statement`] and
+    /// [`rusqlite::CachedStatement`] (the latter via deref coercion).
+    fn row<P: Params>(stmt: &mut Statement<'_>, params: P) -> Result<Self, TableError> {
+        flatten_row(stmt.query_row(params, |row| Ok(Self::from_row(row))))
+    }
+
+    /// Process every row from the table's default `SELECT *` query using a
+    /// callback. Builds and discards the prepared statement internally, so
+    /// the caller never sees it.
     ///
-    /// Uses the default `Table` implementation to prepare the statement and query the rows.
-    ///
-    /// To execute custom queries, see the [`message`](crate::tables::messages::message) module docs for examples.
+    /// Use this for full-table scans where the callback style fits. For
+    /// custom statements (filters, joins, bound parameters), prepare the
+    /// statement yourself and iterate via [`Table::rows`]. See the
+    /// [`message`](crate::tables::messages::message) module docs for an
+    /// example.
     ///
     /// # Example
     ///
@@ -72,7 +101,6 @@ pub trait Table: Sized {
     ///    util::dirs::default_db_path
     /// };
     ///
-    /// // Get a connection to the database
     /// let db_path = default_db_path();
     /// let db = get_connection(&db_path).unwrap();
     ///
@@ -93,14 +121,7 @@ pub trait Table: Sized {
         stream_table_callback::<Self, F, E>(db, callback)
     }
 
-    /// Get a BLOB from the table
-    ///
-    /// # Arguments
-    ///
-    /// * `db` - The database connection
-    /// * `table` - The name of the table
-    /// * `column` - The name of the column containing the BLOB
-    /// * `rowid` - The row ID to retrieve the BLOB from
+    /// Open a `BLOB` column for the supplied `rowid`.
     fn get_blob<'a>(
         &self,
         db: &'a Connection,
@@ -112,7 +133,7 @@ pub trait Table: Sized {
             .ok()
     }
 
-    /// Check if a BLOB exists in the table
+    /// Return whether a `BLOB` column is non-null for the supplied `rowid`.
     fn has_blob(&self, db: &Connection, table: &str, column: &str, rowid: i64) -> bool {
         let sql = std::format!(
             "SELECT ({column} IS NOT NULL) AS not_null
@@ -127,6 +148,17 @@ pub trait Table: Sized {
     }
 }
 
+/// Flatten the doubly-nested result produced by `rusqlite::query_map` /
+/// `query_row` callbacks into a single [`TableError`]. The outer layer
+/// represents row-fetch failures, the inner layer represents row-deserialize
+/// failures from [`Table::from_row`].
+fn flatten_row<T>(item: Result<Result<T, Error>, Error>) -> Result<T, TableError> {
+    match item {
+        Ok(Ok(row)) => Ok(row),
+        Err(why) | Ok(Err(why)) => Err(TableError::QueryError(why)),
+    }
+}
+
 fn stream_table_callback<T, F, E>(db: &Connection, mut callback: F) -> Result<(), E>
 where
     T: Table + Sized,
@@ -134,30 +166,24 @@ where
     F: FnMut(Result<T, TableError>) -> Result<(), E>,
 {
     let mut stmt = T::get(db).map_err(E::from)?;
-    let rows = stmt
-        .query_map([], |row| Ok(T::from_row(row)))
-        .map_err(TableError::from)
-        .map_err(E::from)?;
-
-    for row_result in rows {
-        let item_result = T::extract(row_result);
-        callback(item_result)?;
+    for row_result in T::rows(&mut stmt, []).map_err(E::from)? {
+        callback(row_result)?;
     }
     Ok(())
 }
 
-/// Defines behavior for table data that can be cached in memory
+/// Table data that can be materialized into an in-memory map.
 pub trait Cacheable {
-    /// The key type for the cache `HashMap`
+    /// Key type for the cache map.
     type K;
-    /// The value type for the cache `HashMap`
+    /// Value type for the cache map.
     type V;
-    /// Caches the table data in a `HashMap`
+    /// Build the cache from the database.
     fn cache(db: &Connection) -> Result<HashMap<Self::K, Self::V>, TableError>;
 }
 
 // MARK: Database
-/// Get a connection to the iMessage `SQLite` database
+/// Open the Messages `SQLite` database read-only.
 /// # Example:
 ///
 /// ```
@@ -175,7 +201,12 @@ pub fn get_connection(path: &Path) -> Result<Connection, TableError> {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) {
-            Ok(res) => Ok(res),
+            Ok(connection) => {
+                // Read pages from the mapped region where SQLite supports it.
+                let _ = connection.pragma_update(None, "mmap_size", 8_589_934_592_i64); // up to 8 GiB
+                let _ = connection.pragma_update(None, "cache_size", -65_536_i64); // ~64 MiB
+                Ok(connection)
+            }
             Err(why) => Err(TableError::CannotConnect(TableConnectError::Permissions(
                 why,
             ))),
@@ -195,7 +226,7 @@ pub fn get_connection(path: &Path) -> Result<Connection, TableError> {
     )))
 }
 
-/// Get the size of the database on the disk
+/// Return the database file size on disk.
 /// # Example:
 ///
 /// ```
@@ -213,53 +244,53 @@ pub fn get_db_size(path: &Path) -> Result<u64, TableError> {
 
 // MARK: Constants
 // Table Names
-/// Handle table name
+/// Handle table name.
 pub const HANDLE: &str = "handle";
-/// Message table name
+/// Message table name.
 pub const MESSAGE: &str = "message";
-/// Chat table name
+/// Chat table name.
 pub const CHAT: &str = "chat";
-/// Attachment table name
+/// Attachment table name.
 pub const ATTACHMENT: &str = "attachment";
-/// Chat to message join table name
+/// Chat-to-message join table name.
 pub const CHAT_MESSAGE_JOIN: &str = "chat_message_join";
-/// Message to attachment join table name
+/// Message-to-attachment join table name.
 pub const MESSAGE_ATTACHMENT_JOIN: &str = "message_attachment_join";
-/// Chat to handle join table name
+/// Chat-to-handle join table name.
 pub const CHAT_HANDLE_JOIN: &str = "chat_handle_join";
-/// Recently deleted messages table
+/// Recently deleted messages table.
 pub const RECENTLY_DELETED: &str = "chat_recoverable_message_join";
 
 // Column names
-/// The payload data column contains `plist`-encoded app message data
+/// [`plist`](crate::util::plist)-encoded app-message payload column.
 pub const MESSAGE_PAYLOAD: &str = "payload_data";
-/// The message summary info column contains `plist`-encoded edited message information
+/// [`plist`](crate::util::plist)-encoded message summary column.
 pub const MESSAGE_SUMMARY_INFO: &str = "message_summary_info";
-/// The `attributedBody` column contains [`typedstream`](crate::util::typedstream)-encoded message body text with many other attributes
+/// [`typedstream`](crate::util::typedstream)-encoded attributed body column.
 pub const ATTRIBUTED_BODY: &str = "attributedBody";
-/// The sticker user info column contains `plist`-encoded metadata for sticker attachments
+/// [`plist`](crate::util::plist)-encoded sticker metadata column.
 pub const STICKER_USER_INFO: &str = "sticker_user_info";
-/// The attribution info contains `plist`-encoded metadata for sticker attachments
+/// [`plist`](crate::util::plist)-encoded attachment attribution column.
 pub const ATTRIBUTION_INFO: &str = "attribution_info";
-/// The properties column contains `plist`-encoded metadata for a chat
+/// [`plist`](crate::util::plist)-encoded chat properties column.
 pub const PROPERTIES: &str = "properties";
 
 // Default information
-/// Name used for messages sent by the database owner in a first-person context
+/// First-person display name for the database owner.
 pub const ME: &str = "Me";
-/// Name used for messages sent by the database owner in a second-person context
+/// Second-person display name for the database owner.
 pub const YOU: &str = "You";
-/// Name used for contacts or chats where the name cannot be discovered
+/// Display name used when a contact or chat name is unavailable.
 pub const UNKNOWN: &str = "Unknown";
-/// Default location for the Messages database on macOS
+/// Default macOS Messages database path.
 pub const DEFAULT_PATH_MACOS: &str = "Library/Messages/chat.db";
-/// Default location for the Messages database in an iOS backup
+/// Default Messages database path inside an iOS backup.
 pub const DEFAULT_PATH_IOS: &str = "3d/3d0d7e5fb2ce288813306e4d4636395e047a3d28";
-/// Chat name reserved for messages that do not belong to a chat in the table
+/// Chat name reserved for messages that do not belong to a chat row.
 pub const ORPHANED: &str = "orphaned";
-/// Replacement text sent in Fitness.app messages
+/// Replacement token found in Fitness.app messages.
 pub const FITNESS_RECEIVER: &str = "$(kIMTranscriptPluginBreadcrumbTextReceiverIdentifier)";
-/// Name for attachments directory in exports
+/// Attachments directory name used in exports.
 pub const ATTACHMENTS_DIR: &str = "attachments";
 
 #[cfg(test)]

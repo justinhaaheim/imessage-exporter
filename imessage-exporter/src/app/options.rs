@@ -1,5 +1,5 @@
 /*!
- Represents CLI options and validation logic.
+ CLI option parsing and validation.
 */
 
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ use crate::app::{
 };
 
 // MARK: Constants
-/// Default export directory name
+/// Default export directory name.
 pub const DEFAULT_OUTPUT_DIR: &str = "imessage_export";
 
 // CLI Arg Names
@@ -43,6 +43,7 @@ pub const OPTION_CONVERSATION_FILTER: &str = "conversation-filter";
 pub const OPTION_CONVERSATION_WITH: &str = "conversation-with";
 pub const OPTION_CLEARTEXT_PASSWORD: &str = "cleartext-password";
 pub const OPTION_CUSTOM_CONTACTS_DB_PATH: &str = "contacts-path";
+pub const OPTION_NO_PROGRESS: &str = "no-progress";
 
 // Other CLI Text
 pub const SUPPORTED_FILE_TYPES: &str = "txt, html, timeline";
@@ -55,33 +56,33 @@ pub const ABOUT: &str = concat!(
 );
 
 // MARK: Options
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct Options {
-    /// Path to database file
+    /// Database file or iOS backup root.
     pub db_path: PathBuf,
-    /// Custom path to attachments
+    /// Custom root for attachment lookup.
     pub attachment_root: Option<String>,
-    /// The attachment manager type used to copy files
+    /// Attachment copy/conversion manager.
     pub attachment_manager: AttachmentManager,
-    /// If true, emit diagnostic information to stdout
+    /// Whether to emit diagnostic information to stdout.
     pub diagnostic: bool,
-    /// The type of file we are exporting data to
+    /// Selected export format.
     pub export_type: Option<ExportType>,
-    /// Where the app will save exported data
+    /// Directory where exported data is written.
     pub export_path: PathBuf,
-    /// Query context describing SQL query filters
+    /// SQL query filters.
     pub query_context: QueryContext,
-    /// If true, do not include `loading="lazy"` in HTML exports
+    /// Whether to omit `loading="lazy"` in HTML exports.
     pub no_lazy: bool,
-    /// Custom name for database owner in output
+    /// Custom name for the database owner in output.
     pub custom_name: Option<String>,
-    /// If true, use the database owner's caller ID instead of "Me"
+    /// Whether to use the database owner's caller ID instead of `Me`.
     pub use_caller_id: bool,
-    /// The database source's platform
+    /// Database source platform.
     pub platform: Platform,
-    /// If true, disable the free disk space check
+    /// Whether to disable the free disk space check.
     pub ignore_disk_space: bool,
-    /// An optional filter for conversation participants
+    /// Participant-name filter for conversations.
     pub conversation_filter: Option<String>,
     /// Specific exact-match participant sets for conversation selection.
     ///
@@ -90,10 +91,40 @@ pub struct Options {
     /// deduplicated non-self participant set equals the set the entry
     /// resolves to. Multiple entries are unioned.
     pub conversation_with: Vec<String>,
-    /// An optional password for encrypted backups
+    /// Password for encrypted backups.
     pub cleartext_password: Option<String>,
-    /// An optional path to a custom contacts database
+    /// Custom contacts database path.
     pub contacts_path: Option<PathBuf>,
+    /// Whether to show the export progress bar when the terminal supports it.
+    pub show_progress: bool,
+}
+
+// Redact the cleartext backup password from debug output.
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("db_path", &self.db_path)
+            .field("attachment_root", &self.attachment_root)
+            .field("attachment_manager", &self.attachment_manager)
+            .field("diagnostic", &self.diagnostic)
+            .field("export_type", &self.export_type)
+            .field("export_path", &self.export_path)
+            .field("query_context", &self.query_context)
+            .field("no_lazy", &self.no_lazy)
+            .field("custom_name", &self.custom_name)
+            .field("use_caller_id", &self.use_caller_id)
+            .field("platform", &self.platform)
+            .field("ignore_disk_space", &self.ignore_disk_space)
+            .field("conversation_filter", &self.conversation_filter)
+            // Don't print the actual password if it's set
+            .field(
+                "cleartext_password",
+                &self.cleartext_password.as_ref().map(|_| "***"),
+            )
+            .field("contacts_path", &self.contacts_path)
+            .field("show_progress", &self.show_progress)
+            .finish()
+    }
 }
 
 // MARK: Validation
@@ -119,6 +150,7 @@ impl Options {
             .unwrap_or_default();
         let cleartext_password: Option<&String> = args.get_one(OPTION_CLEARTEXT_PASSWORD);
         let contacts_path: Option<&String> = args.get_one(OPTION_CUSTOM_CONTACTS_DB_PATH);
+        let show_progress = !args.get_flag(OPTION_NO_PROGRESS);
 
         // Build the export type
         let export_type: Option<ExportType> = match export_file_type {
@@ -142,6 +174,7 @@ impl Options {
                 (use_caller_id, OPTION_USE_CALLER_ID),
                 (conversation_filter.is_some(), OPTION_CONVERSATION_FILTER),
                 (!conversation_with.is_empty(), OPTION_CONVERSATION_WITH),
+                (!show_progress, OPTION_NO_PROGRESS),
             ];
             for (set, opt) in format_deps {
                 if set {
@@ -164,6 +197,7 @@ impl Options {
             (custom_name.is_some(), OPTION_CUSTOM_NAME),
             (conversation_filter.is_some(), OPTION_CONVERSATION_FILTER),
             (!conversation_with.is_empty(), OPTION_CONVERSATION_WITH),
+            (!show_progress, OPTION_NO_PROGRESS),
         ];
         for (set, opt) in diag_conflicts {
             if diagnostic && set {
@@ -244,7 +278,7 @@ impl Options {
             }
         }
 
-        // Warn the user that custom contacts database path have no effect on iOS backups
+        // Custom contacts paths do not affect encrypted iOS backup extraction.
         if contacts_path.is_some() && platform == Platform::iOS {
             eprintln!(
                 "Option --{OPTION_CUSTOM_CONTACTS_DB_PATH} is enabled, but the platform is {}, so the path will have no effect!",
@@ -282,10 +316,11 @@ impl Options {
             conversation_with,
             cleartext_password: cleartext_password.cloned(),
             contacts_path: contacts_path.cloned().map(PathBuf::from),
+            show_progress,
         })
     }
 
-    /// Generate a path to the database based on the currently selected platform
+    /// Return the database path for the selected platform.
     pub fn get_db_path(&self) -> PathBuf {
         match self.platform {
             Platform::iOS => self.db_path.join(DEFAULT_PATH_IOS),
@@ -294,9 +329,10 @@ impl Options {
     }
 }
 
-/// Ensure export path is empty or does not contain files of the existing export type
+/// Resolve and validate the export directory.
 ///
-/// We have to allocate a `PathBuf` here because it can be created from data owned by this function in the default state
+/// When an export type is selected, the directory must not already contain
+/// files with that extension.
 fn validate_path(
     export_path: Option<&String>,
     export_type: Option<&ExportType>,
@@ -379,7 +415,7 @@ fn get_command() -> Command {
             Arg::new(OPTION_DB_PATH)
                 .short('p')
                 .long(OPTION_DB_PATH)
-                .help(format!("Specify an optional custom path for the iMessage database location\nFor macOS, specify a path to a `chat.db` file\nFor iOS, specify a path to the root of a device backup directory\nIf the iOS backup is encrypted, --{OPTION_CLEARTEXT_PASSWORD} must be passed\nIf omitted, the default directory is {}\n", default_db_path().display()))
+                .help(format!("Specify an optional custom path for the iMessage database location\nFor macOS, specify a path to a `chat.db` file\nFor iOS, specify a path to the root of a device backup directory\nIf the iOS backup is encrypted, --{OPTION_CLEARTEXT_PASSWORD} can be passed or you will be prompted for the password\nIf omitted, the default directory is {}\n", default_db_path().display()))
                 .display_order(3)
                 .value_name("path/to/source"),
         )
@@ -475,8 +511,8 @@ fn get_command() -> Command {
             Arg::new(OPTION_CLEARTEXT_PASSWORD)
                 .short('x')
                 .long(OPTION_CLEARTEXT_PASSWORD)
-                .help("Optional password for encrypted iOS backups\nThis is only used when the source is an encrypted iOS backup directory\n")
-                .display_order(15)
+                .help("Optional password for encrypted iOS backups\nThis is only used when the source is an encrypted iOS backup directory\nIf omitted on an encrypted backup, you will be prompted for the password (recommended)\nA password provided with this option is visible on screen, in the process table, and in your shell history\n")
+                .display_order(14)
                 .value_name("password"),
         )
         .arg(
@@ -487,11 +523,20 @@ fn get_command() -> Command {
                 .display_order(16)
                 .value_name("path"),
         )
+        .arg(
+            Arg::new(OPTION_NO_PROGRESS)
+                .long(OPTION_NO_PROGRESS)
+                .help("Disable the on-screen progress bar regardless of context\nBy default, the progress bar is shown only when stderr is a terminal,\nso headless invocations (CI, output redirected to a logfile) stay clean automatically.\nUse this flag to suppress the bar even in an interactive terminal.\n")
+                .action(ArgAction::SetTrue)
+                .display_order(16),
+        )
 }
 
 #[cfg(test)]
 impl Options {
     pub fn fake_options(export_type: ExportType) -> Options {
+        use crate::app::test_dir::unique_test_dir;
+
         Options {
             db_path: std::env::current_dir()
                 .unwrap()
@@ -502,7 +547,7 @@ impl Options {
             attachment_manager: AttachmentManager::default(),
             diagnostic: false,
             export_type: Some(export_type),
-            export_path: PathBuf::from("/tmp"),
+            export_path: unique_test_dir("fake-options"),
             query_context: QueryContext::default(),
             no_lazy: false,
             custom_name: None,
@@ -513,6 +558,7 @@ impl Options {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         }
     }
 }
@@ -524,8 +570,6 @@ pub fn from_command_line() -> ArgMatches {
 
 #[cfg(test)]
 mod arg_tests {
-    use std::fs;
-
     use imessage_database::util::{
         dirs::default_db_path, platform::Platform, query_context::QueryContext,
     };
@@ -534,11 +578,11 @@ mod arg_tests {
         compatibility::attachment_manager::{AttachmentManager, AttachmentManagerMode},
         export_type::ExportType,
         options::{Options, get_command, validate_path},
+        test_dir::unique_test_dir,
     };
 
     #[test]
     fn can_build_option_diagnostic_flag() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-d"]);
 
@@ -563,6 +607,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -570,7 +615,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_diagnostic_flag_with_export_type() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-d", "-f", "txt"]);
         assert!(Options::from_args(&args).is_err());
@@ -578,7 +622,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_diagnostic_flag_with_export_path() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-d", "-o", "~/test"]);
         assert!(Options::from_args(&args).is_err());
@@ -586,7 +629,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_diagnostic_flag_with_attachment_manager() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-d", "-c", "basic"]);
         assert!(Options::from_args(&args).is_err());
@@ -594,7 +636,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_diagnostic_flag_with_start_date() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-d", "-s", "2020-01-01"]);
         assert!(Options::from_args(&args).is_err());
@@ -602,7 +643,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_diagnostic_flag_with_end() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-d", "-e", "2020-01-01"]);
         assert!(Options::from_args(&args).is_err());
@@ -610,7 +650,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_diagnostic_flag_with_caller_id() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-d", "-i"]);
         assert!(Options::from_args(&args).is_err());
@@ -618,14 +657,9 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_export_html() {
-        // Use an isolated tempdir so unrelated leftover files in /tmp can't
-        // trip `validate_path`'s same-extension check.
-        let dir = std::env::temp_dir().join("imessage_path_test_can_build_option_export_html");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = unique_test_dir("build-option-export-html");
         let dir_str = dir.to_string_lossy().into_owned();
 
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-f", "html", "-o", &dir_str]);
 
@@ -650,6 +684,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -657,7 +692,6 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_export_txt_no_lazy() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-f", "txt", "-l"]);
 
@@ -682,6 +716,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -689,7 +724,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_attachment_manager_no_export_type() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-c", "clone"]);
         assert!(Options::from_args(&args).is_err());
@@ -697,7 +731,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_export_path_no_export_type() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-o", "~/test"]);
         assert!(Options::from_args(&args).is_err());
@@ -705,7 +738,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_start_date_path_no_export_type() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-s", "2020-01-01"]);
         assert!(Options::from_args(&args).is_err());
@@ -713,7 +745,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_end_date_path_no_export_type() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-e", "2020-01-01"]);
         assert!(Options::from_args(&args).is_err());
@@ -721,7 +752,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_invalid_date() {
-        // Get matches from sample args
         let command = get_command();
         let args =
             command.get_matches_from(["imessage-exporter", "-f", "html", "-e", "2020-32-32"]);
@@ -730,7 +760,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_invalid_platform() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-a", "iPad"]);
         assert!(Options::from_args(&args).is_err());
@@ -738,7 +767,6 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_valid_platform() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-a", "ios", "-f", "txt"]);
 
@@ -763,6 +791,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -770,7 +799,6 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_ios_password() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from([
             "imessage-exporter",
@@ -803,6 +831,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: Some("password".to_string()),
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -810,7 +839,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_macos_password() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from([
             "imessage-exporter",
@@ -826,7 +854,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_invalid_export_type() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-f", "pdf"]);
         assert!(Options::from_args(&args).is_err());
@@ -834,7 +861,6 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_custom_name() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-f", "txt", "-m", "Name"]);
 
@@ -859,6 +885,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -866,7 +893,6 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_caller_id() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-f", "txt", "-i"]);
 
@@ -891,6 +917,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -898,7 +925,6 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_contact_filter() {
-        // Get matches from sample args
         let command = get_command();
         let args =
             command.get_matches_from(["imessage-exporter", "-t", "steve@apple.com", "-f", "txt"]);
@@ -924,6 +950,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -931,7 +958,6 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_full() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-f", "txt", "-c", "full"]);
 
@@ -956,6 +982,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -963,7 +990,6 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_clone() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-f", "txt", "-c", "clone"]);
 
@@ -988,6 +1014,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -995,7 +1022,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_custom_name_and_caller_id() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-f", "txt", "-m", "Name", "-i"]);
         assert!(Options::from_args(&args).is_err());
@@ -1003,7 +1029,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_caller_id_no_export() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-i"]);
         assert!(Options::from_args(&args).is_err());
@@ -1011,7 +1036,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_custom_name_no_export() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-m", "Name"]);
         assert!(Options::from_args(&args).is_err());
@@ -1019,7 +1043,6 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_contact_filter_no_export() {
-        // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-t", "steve@apple.com"]);
         assert!(Options::from_args(&args).is_err());
@@ -1135,6 +1158,7 @@ mod arg_tests {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
+            show_progress: true,
         };
 
         assert_eq!(actual, expected);
@@ -1151,6 +1175,33 @@ mod arg_tests {
         let args = get_command().get_matches_from(["imessage-exporter", "-n", "/does/not/exist"]);
         assert!(Options::from_args(&args).is_err());
     }
+
+    #[test]
+    fn can_build_option_no_progress() {
+        let args =
+            get_command().get_matches_from(["imessage-exporter", "-f", "txt", "--no-progress"]);
+        let actual = Options::from_args(&args).unwrap();
+        assert!(!actual.show_progress);
+    }
+
+    #[test]
+    fn show_progress_defaults_to_true() {
+        let args = get_command().get_matches_from(["imessage-exporter", "-f", "txt"]);
+        let actual = Options::from_args(&args).unwrap();
+        assert!(actual.show_progress);
+    }
+
+    #[test]
+    fn cant_build_option_no_progress_no_export_type() {
+        let args = get_command().get_matches_from(["imessage-exporter", "--no-progress"]);
+        assert!(Options::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn cant_build_option_diagnostic_flag_with_no_progress() {
+        let args = get_command().get_matches_from(["imessage-exporter", "-d", "--no-progress"]);
+        assert!(Options::from_args(&args).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1162,23 +1213,16 @@ mod path_tests {
     use crate::app::{
         export_type::ExportType,
         options::{DEFAULT_OUTPUT_DIR, validate_path},
+        test_dir::unique_test_dir,
     };
-    use imessage_database::util::dirs::home;
 
-    /// Build a fresh, empty tempdir unique to the calling test so parallel
-    /// runs do not race on `/tmp` and unrelated leftover files from prior
-    /// runs cannot trip `validate_path`'s same-extension check.
-    fn tempdir_for_test(test_name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("imessage_path_test_{test_name}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use imessage_database::util::dirs::home;
 
     #[test]
     fn can_validate_empty() {
-        let dir = tempdir_for_test("can_validate_empty");
+        let dir = unique_test_dir("validate-empty");
         let dir_str = dir.to_string_lossy().into_owned();
+        let export_path = Some(&dir_str);
         let export_type = Some(ExportType::Txt);
 
         let result = validate_path(Some(&dir_str), export_type.as_ref());
@@ -1188,30 +1232,31 @@ mod path_tests {
 
     #[test]
     fn can_validate_different_type() {
-        let dir = tempdir_for_test("can_validate_different_type");
-        // A pre-existing file of a *different* extension must not trip the
-        // same-type check.
-        let mut other_ext = dir.clone();
-        other_ext.push("fake1.html");
-        let mut file = fs::File::create(&other_ext).unwrap();
-        file.write_all(&[]).unwrap();
-
+        let dir = unique_test_dir("validate-different-type");
         let dir_str = dir.to_string_lossy().into_owned();
-        let result = validate_path(Some(&dir_str), Some(&ExportType::Txt));
+        let export_path = Some(&dir_str);
+        let export_type = Some(ExportType::Txt);
+
+        let result = validate_path(export_path, export_type.as_ref());
+
+        let mut fake = dir.clone();
+        fake.push("fake1.html");
+        let mut file = fs::File::create(&fake).unwrap();
+        file.write_all(&[]).unwrap();
 
         assert_eq!(result.unwrap(), dir);
     }
 
     #[test]
     fn can_validate_same_type() {
-        let dir = tempdir_for_test("can_validate_same_type");
-        // A pre-existing file of the *same* extension must trip the check.
-        let mut same_ext = dir.clone();
-        same_ext.push("fake2.txt");
-        let mut file = fs::File::create(&same_ext).unwrap();
+        let dir = unique_test_dir("validate-same-type");
+        let dir_str = dir.to_string_lossy().into_owned();
+
+        let mut fake = dir.clone();
+        fake.push("fake2.txt");
+        let mut file = fs::File::create(&fake).unwrap();
         file.write_all(&[]).unwrap();
 
-        let dir_str = dir.to_string_lossy().into_owned();
         let result = validate_path(Some(&dir_str), Some(&ExportType::Txt));
 
         assert!(result.is_err(), "expected error, got: {:?}", result);
