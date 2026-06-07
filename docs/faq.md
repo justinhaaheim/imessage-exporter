@@ -4,25 +4,25 @@
 
 Ensure your terminal emulator has [full disk access](https://kb.synology.com/en-us/C2/tutorial/How_to_enable_Full_Disk_Access_on_a_Mac) if using the default location or ensure that the path to the database file is correct.
 
-***
+---
 
 ## Are emojis, tapbacks (reactions), and other special message features preserved in the export?
 
 Yes, all iMessage features are supported. See [here](features.md) for more detail.
 
-***
+---
 
 ## Can it export messages from third-party apps that integrate with iMessage?
 
 Yes. See [here](features.md) for more detail on supported features.
 
-***
+---
 
 ## Does `imessage-exporter` export message conversations that are in iCloud or on a user's iPhone/iPad but not on the user's Mac?
 
 `imessage-exporter` only reads data present in the provided source, which can be either macOS's `chat.db` or a local full iOS backup. It cannot read data that is only stored in iCloud.
 
-***
+---
 
 ## Can I force iCloud to download attachments that were offloaded?
 
@@ -34,7 +34,7 @@ In the Messages app, if you click the info (`ⓘ`) button for a conversation and
 
 Yes.
 
-***
+---
 
 ## How does the exporter handle previously exported messages?
 
@@ -42,19 +42,19 @@ If files with the current output type exist in the output directory, `imessage-e
 
 See [here](../imessage-exporter/README.md#how-to-use) for details on `imessage-exporter` arguments.
 
-***
+---
 
 ## Is it possible to export a conversation and re-integrate it back onto another Apple ID?
 
-No, I do not want to be trusted with write access to your iMessage data. This software is *read only*.
+No, I do not want to be trusted with write access to your iMessage data. This software is _read only_.
 
-***
+---
 
 ## Is there a search function?
 
 No, this software just builds exports. I use [`ripgrep`](https://github.com/BurntSushi/ripgrep) to search though the exported files.
 
-***
+---
 
 ## Can it export messages between a specific date range?
 
@@ -62,13 +62,13 @@ Yes, the `--start-date` and `--end-date` arguments specify date ranges for expor
 
 See [here](../imessage-exporter/README.md#how-to-use) for details on `imessage-exporter` arguments.
 
-***
+---
 
 ## Are voice messages be saved?
 
 Expired ones cannot because they are deleted. If you kept them then they are included in the exports.
 
-***
+---
 
 ## Are messages deleted from the messages app erased from the database?
 
@@ -80,7 +80,7 @@ Messages that have expired from this restoration process are permanently deleted
 
 In some instances, deleted messages are removed from the `chat_message_join` table but not from the `messages` table. These messages will populate in `Orphaned.html` or `Orphaned.txt`.
 
-***
+---
 
 ## How fast is `imessage-exporter`?
 
@@ -89,11 +89,11 @@ This is a complicated question that depends on CPU, database size, chosen export
 On my M1 Max MacBook Pro, approximate performance is as follows:
 
 | `--copy-method` | Messages exported per second |
-|---|---|
-| `disabled` | > 112,000 |
-| `clone` | ≈ 42,000 |
-| `basic` | ≈ 350 |
-| `full` | ≈ 250 |
+| --------------- | ---------------------------- |
+| `disabled`      | > 112,000                    |
+| `clone`         | ≈ 42,000                     |
+| `basic`         | ≈ 350                        |
+| `full`          | ≈ 250                        |
 
 For more information on `--copy-method`, see [here](../imessage-exporter/README.md#how-to-use) and [here](./features.md#supported-message-features).
 

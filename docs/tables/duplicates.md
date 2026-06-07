@@ -23,10 +23,10 @@ These sample tables help visualize the problem.
 Contact `A` has an email `Y` and a phone number `X`. Each are listed in the table under a different `Handle ID`. Contact `B` has a single phone number `Z`. The iMessage database makes no connection to your Contacts app here, it just knows these items exist.
 
 | Handle ID | Contact | Person Centric ID |
-| -- | -- | -- |
-| 1 | Y | A |
-| 2 | X | A |
-| 3 | Z | B |
+| --------- | ------- | ----------------- |
+| 1         | Y       | A                 |
+| 2         | X       | A                 |
+| 3         | Z       | B                 |
 
 The `Person Centric ID` is a unique identifier for each contact. Here, we can use it to determine which `Handle`s belong to `A` and which belong to `B`.
 
@@ -35,30 +35,30 @@ The `Person Centric ID` is a unique identifier for each contact. Here, we can us
 When you receive a message from `A`, you either receive from the address `Y` or `Z`. Each of these is listed under a separate chat (thread):
 
 | Chat ID | Handle ID | Group ID |
-| -- | -- | -- |
-| 10 | 1 | A |
-| 11 | 2 | A |
-| 12 | 3 | B |
-| 12 | 2 | B |
+| ------- | --------- | -------- |
+| 10      | 1         | A        |
+| 11      | 2         | A        |
+| 12      | 3         | B        |
+| 12      | 2         | B        |
 
 Note: The `Chat ID` is not unique, it represents group chats as well, so in this example there is a group chat `12` with 3 participants, yourself, `A`, and `B`.
 
 ## The Many-To-Many Problem
 
-Chats between yourself and `A` *should* go to the same chat, because `Y` and `X` are actually the same person. Further, any messages sent to chat `12` from any of the addresses of the participants *should* go to the same chat, not a separate one with the same participants. This does not happen, because the iMessage Database uses the `Handle ID` field here, not the `Person Centric ID`.
+Chats between yourself and `A` _should_ go to the same chat, because `Y` and `X` are actually the same person. Further, any messages sent to chat `12` from any of the addresses of the participants _should_ go to the same chat, not a separate one with the same participants. This does not happen, because the iMessage Database uses the `Handle ID` field here, not the `Person Centric ID`.
 
 If contact `A` sends messages from `Y` and `X`, you will see two separate conversations. Given the above table, messages from `Y` will go to `10` and messages from `X` will go to `11`, even though said messages should belong to the same chat.
 
 Further, if contact `A` sends messages from `Y` and `X` to you and `B`, only messages from `X` will go to chat `12`. Messages `A` sends from `Y` will go to a new chat, `13`, that contains the same participants but with `A` under a second ID:
 
 | Chat ID | Handle ID |
-| -- | -- |
-| 10 | 1 |
-| 11 | 2 |
-| 12 | 3 |
-| 12 | 2 |
-| 13 | 1 |
-| 13 | 3 |
+| ------- | --------- |
+| 10      | 1         |
+| 11      | 2         |
+| 12      | 3         |
+| 12      | 2         |
+| 13      | 1         |
+| 13      | 3         |
 
 Chats `12` and `13` are the same group of people, but because the IDs of the participants are different, the messages get sorted into a separate chat.
 
@@ -72,9 +72,9 @@ First, generate a map of each `Person Centric ID` to its corresponding handles. 
 
 ```json
 {
-    1: "X, Y",
-    2: "X, Y",
-    3: "Z"
+  "1": "X, Y",
+  "2": "X, Y",
+  "3": "Z"
 }
 ```
 

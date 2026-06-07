@@ -11,6 +11,9 @@ pub enum ExportType {
     Html,
     /// Text file export
     Txt,
+    /// Unified Markdown timeline: a single `.md` file that groups every message
+    /// across all threads by day, then by conversation thread within that day
+    Timeline,
 }
 
 impl ExportType {
@@ -19,6 +22,7 @@ impl ExportType {
         match format.to_lowercase().as_str() {
             "txt" => Some(Self::Txt),
             "html" => Some(Self::Html),
+            "timeline" | "md" | "markdown" => Some(Self::Timeline),
             _ => None,
         }
     }
@@ -28,6 +32,7 @@ impl ExportType {
         match self {
             ExportType::Html => ".html",
             ExportType::Txt => ".txt",
+            ExportType::Timeline => ".md",
         }
     }
 }
@@ -37,6 +42,7 @@ impl Display for ExportType {
         match self {
             ExportType::Txt => write!(fmt, "txt"),
             ExportType::Html => write!(fmt, "html"),
+            ExportType::Timeline => write!(fmt, "timeline"),
         }
     }
 }
@@ -73,5 +79,30 @@ mod tests {
         assert!(ExportType::from_cli("pdf").is_none());
         assert!(ExportType::from_cli("json").is_none());
         assert!(ExportType::from_cli("").is_none());
+    }
+
+    #[test]
+    fn can_parse_timeline_any_case() {
+        assert!(matches!(
+            ExportType::from_cli("timeline"),
+            Some(ExportType::Timeline)
+        ));
+        assert!(matches!(
+            ExportType::from_cli("TIMELINE"),
+            Some(ExportType::Timeline)
+        ));
+        assert!(matches!(
+            ExportType::from_cli("md"),
+            Some(ExportType::Timeline)
+        ));
+        assert!(matches!(
+            ExportType::from_cli("MARKDOWN"),
+            Some(ExportType::Timeline)
+        ));
+    }
+
+    #[test]
+    fn timeline_extension_is_md() {
+        assert_eq!(ExportType::Timeline.extension(), ".md");
     }
 }

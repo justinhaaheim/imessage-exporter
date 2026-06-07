@@ -3,7 +3,7 @@
 mod app;
 mod exporters;
 
-pub use exporters::{exporter::Exporter, html::HTML, txt::TXT};
+pub use exporters::{exporter::Exporter, html::HTML, timeline::Timeline, txt::TXT};
 
 use app::{
     options::{Options, from_command_line},
@@ -21,9 +21,9 @@ fn main() {
         Ok(options) => match Config::new(options) {
             Ok(mut app) => {
                 // Resolve the filtered contacts, if provided
-                app.resolve_filtered_handles();
-
-                if let Err(why) = app.start() {
+                if let Err(why) = app.resolve_filtered_handles() {
+                    eprintln!("Unable to export: {why}");
+                } else if let Err(why) = app.start() {
                     eprintln!("Unable to export: {why}");
                 }
             }

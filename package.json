@@ -1,0 +1,42 @@
+{
+  "name": "imessage-exporter",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "setup-env": "bun scripts/setup-env.ts",
+    "signal": "bunx justin-sdk signal --quiet",
+    "signal:verbose": "bunx justin-sdk signal",
+    "signal:serial": "bunx justin-sdk signal --serial",
+    "doctor": "bunx justin-sdk doctor",
+    "doctor:fix": "bunx justin-sdk doctor --fix",
+    "signal-source:TS": "tsc --noEmit",
+    "signal-source:LINT": "eslint --report-unused-disable-directives --max-warnings 0 .",
+    "signal-source:PRETTIER": "prettier --check .",
+    "lint-base": "eslint --report-unused-disable-directives --max-warnings 0",
+    "lint": "bun run lint-base -- .",
+    "lint:fix": "bun run lint-base -- --fix .",
+    "lint:fix:file": "bun run lint-base -- --fix",
+    "prepare": "husky",
+    "install-my-prompts": "npx -y git+https://github.com/justinhaaheim/prompts#bc5994b48b --target-dir docs/prompts --md"
+  },
+  "devDependencies": {
+    "@justinhaaheim/justin-sdk": "github:justinhaaheim/justin-sdk#0.5.0",
+    "prettier": "3.6.2",
+    "typescript": "5.9.2",
+    "@types/bun": "latest",
+    "eslint": "9.31.0",
+    "eslint-config-jha-react-node": "github:justinhaaheim/eslint-config-jha-react-node",
+    "husky": "9.1.7",
+    "lint-staged": "16.2.7"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx,cjs,mjs}": [
+      "bun run lint-base -- --fix",
+      "prettier --write"
+    ],
+    "*.{json,md,yml,yaml}": [
+      "prettier --write"
+    ]
+  }
+}

@@ -40,17 +40,18 @@ pub const OPTION_PLATFORM: &str = "platform";
 pub const OPTION_BYPASS_FREE_SPACE_CHECK: &str = "ignore-disk-warning";
 pub const OPTION_USE_CALLER_ID: &str = "use-caller-id";
 pub const OPTION_CONVERSATION_FILTER: &str = "conversation-filter";
+pub const OPTION_CONVERSATION_WITH: &str = "conversation-with";
 pub const OPTION_CLEARTEXT_PASSWORD: &str = "cleartext-password";
 pub const OPTION_CUSTOM_CONTACTS_DB_PATH: &str = "contacts-path";
 
 // Other CLI Text
-pub const SUPPORTED_FILE_TYPES: &str = "txt, html";
+pub const SUPPORTED_FILE_TYPES: &str = "txt, html, timeline";
 pub const SUPPORTED_PLATFORMS: &str = "macOS, iOS";
 pub const SUPPORTED_ATTACHMENT_MANAGER_MODES: &str = "clone, basic, full, disabled";
 pub const ABOUT: &str = concat!(
     "The `imessage-exporter` binary exports iMessage data to\n",
-    "`txt` or `html` formats. It can also run diagnostics\n",
-    "to find problems with the iMessage database."
+    "`txt`, `html`, or `timeline` (Markdown) formats. It can also run\n",
+    "diagnostics to find problems with the iMessage database."
 );
 
 // MARK: Options
@@ -82,6 +83,13 @@ pub struct Options {
     pub ignore_disk_space: bool,
     /// An optional filter for conversation participants
     pub conversation_filter: Option<String>,
+    /// Specific exact-match participant sets for conversation selection.
+    ///
+    /// Each entry is a comma-separated list of participant tokens describing
+    /// one specific conversation. A chat matches an entry when its
+    /// deduplicated non-self participant set equals the set the entry
+    /// resolves to. Multiple entries are unioned.
+    pub conversation_with: Vec<String>,
     /// An optional password for encrypted backups
     pub cleartext_password: Option<String>,
     /// An optional path to a custom contacts database
@@ -105,6 +113,10 @@ impl Options {
         let platform_type: Option<&String> = args.get_one(OPTION_PLATFORM);
         let ignore_disk_space = args.get_flag(OPTION_BYPASS_FREE_SPACE_CHECK);
         let conversation_filter: Option<&String> = args.get_one(OPTION_CONVERSATION_FILTER);
+        let conversation_with: Vec<String> = args
+            .get_many::<String>(OPTION_CONVERSATION_WITH)
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default();
         let cleartext_password: Option<&String> = args.get_one(OPTION_CLEARTEXT_PASSWORD);
         let contacts_path: Option<&String> = args.get_one(OPTION_CUSTOM_CONTACTS_DB_PATH);
 
@@ -129,6 +141,7 @@ impl Options {
                 (custom_name.is_some(), OPTION_CUSTOM_NAME),
                 (use_caller_id, OPTION_USE_CALLER_ID),
                 (conversation_filter.is_some(), OPTION_CONVERSATION_FILTER),
+                (!conversation_with.is_empty(), OPTION_CONVERSATION_WITH),
             ];
             for (set, opt) in format_deps {
                 if set {
@@ -150,6 +163,7 @@ impl Options {
             (use_caller_id, OPTION_USE_CALLER_ID),
             (custom_name.is_some(), OPTION_CUSTOM_NAME),
             (conversation_filter.is_some(), OPTION_CONVERSATION_FILTER),
+            (!conversation_with.is_empty(), OPTION_CONVERSATION_WITH),
         ];
         for (set, opt) in diag_conflicts {
             if diagnostic && set {
@@ -265,6 +279,7 @@ impl Options {
             platform,
             ignore_disk_space,
             conversation_filter: conversation_filter.cloned(),
+            conversation_with,
             cleartext_password: cleartext_password.cloned(),
             contacts_path: contacts_path.cloned().map(PathBuf::from),
         })
@@ -448,11 +463,20 @@ fn get_command() -> Command {
                 .value_name("filter"),
         )
         .arg(
+            Arg::new(OPTION_CONVERSATION_WITH)
+                .short('w')
+                .long(OPTION_CONVERSATION_WITH)
+                .help("Select a specific conversation by exact participant set\nEach -w value lists the comma-separated participants of one conversation\n(without yourself); only conversations whose deduplicated participant set\nequals that list are exported\nRepeat the flag to select multiple specific conversations (results are unioned)\nMay be combined with --conversation-filter; results are unioned\nExample: `-w 5558675309` selects only your DM with that number\nExample: `-w \"alice@apple.com,5558675309\"` selects only the group chat with exactly those two\nExample: `-w alice -w \"alice,bob\"` selects both the alice DM and the alice+bob group\n")
+                .action(ArgAction::Append)
+                .display_order(14)
+                .value_name("participants"),
+        )
+        .arg(
             Arg::new(OPTION_CLEARTEXT_PASSWORD)
                 .short('x')
                 .long(OPTION_CLEARTEXT_PASSWORD)
                 .help("Optional password for encrypted iOS backups\nThis is only used when the source is an encrypted iOS backup directory\n")
-                .display_order(14)
+                .display_order(15)
                 .value_name("password"),
         )
         .arg(
@@ -460,7 +484,7 @@ fn get_command() -> Command {
                 .short('n')
                 .long(OPTION_CUSTOM_CONTACTS_DB_PATH)
                 .help("Optional custom path for a macOS or iOS contacts database file\nThis should be resolved automatically, but can be manually provided\nHandles from the messages table will be mapped to names in the provided database\nGenerally, one of `AddressBook-v22.abcddb` or `AddressBook.sqlitedb`\n")
-                .display_order(15)
+                .display_order(16)
                 .value_name("path"),
         )
 }
@@ -486,6 +510,7 @@ impl Options {
             platform: Platform::macOS,
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         }
@@ -535,6 +560,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -592,25 +618,28 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_export_html() {
-        // Cleanup existing temp data
-        let _ = fs::remove_file("/tmp/orphaned.html");
+        // Use an isolated tempdir so unrelated leftover files in /tmp can't
+        // trip `validate_path`'s same-extension check.
+        let dir = std::env::temp_dir().join("imessage_path_test_can_build_option_export_html");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
 
         // Get matches from sample args
         let command = get_command();
-        let args = command.get_matches_from(["imessage-exporter", "-f", "html", "-o", "/tmp"]);
+        let args = command.get_matches_from(["imessage-exporter", "-f", "html", "-o", &dir_str]);
 
         // Build the Options
         let actual = Options::from_args(&args).unwrap();
 
         // Expected data
-        let tmp_dir = String::from("/tmp");
         let expected = Options {
             db_path: default_db_path(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: false,
             export_type: Some(ExportType::Html),
-            export_path: validate_path(Some(&tmp_dir), None).unwrap(),
+            export_path: validate_path(Some(&dir_str), None).unwrap(),
             query_context: QueryContext::default(),
             no_lazy: false,
             custom_name: None,
@@ -618,6 +647,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -627,9 +657,6 @@ mod arg_tests {
 
     #[test]
     fn can_build_option_export_txt_no_lazy() {
-        // Cleanup existing temp data
-        let _ = fs::remove_file("/tmp/orphaned.txt");
-
         // Get matches from sample args
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-f", "txt", "-l"]);
@@ -652,6 +679,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -732,6 +760,7 @@ mod arg_tests {
             platform: Platform::iOS,
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -771,6 +800,7 @@ mod arg_tests {
             platform: Platform::iOS,
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: Some("password".to_string()),
             contacts_path: None,
         };
@@ -826,6 +856,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -857,6 +888,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -889,6 +921,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: Some(String::from("steve@apple.com")),
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -920,6 +953,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -951,6 +985,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: false,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -991,6 +1026,79 @@ mod arg_tests {
     }
 
     #[test]
+    fn can_build_option_conversation_with_single() {
+        let command = get_command();
+        let args = command.get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "txt",
+            "-w",
+            "alice@apple.com",
+        ]);
+        let actual = Options::from_args(&args).unwrap();
+        assert_eq!(
+            actual.conversation_with,
+            vec![String::from("alice@apple.com")]
+        );
+    }
+
+    #[test]
+    fn can_build_option_conversation_with_repeated() {
+        // Repeating -w should append values, not overwrite.
+        let command = get_command();
+        let args = command.get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "txt",
+            "-w",
+            "alice",
+            "-w",
+            "alice,bob",
+        ]);
+        let actual = Options::from_args(&args).unwrap();
+        assert_eq!(
+            actual.conversation_with,
+            vec![String::from("alice"), String::from("alice,bob")]
+        );
+    }
+
+    #[test]
+    fn can_build_option_conversation_with_combined_with_filter() {
+        let command = get_command();
+        let args = command.get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "txt",
+            "-t",
+            "charlie",
+            "-w",
+            "alice,bob",
+        ]);
+        let actual = Options::from_args(&args).unwrap();
+        assert_eq!(actual.conversation_filter, Some(String::from("charlie")));
+        assert_eq!(
+            actual.conversation_with,
+            vec![String::from("alice,bob")]
+        );
+    }
+
+    #[test]
+    fn cant_build_option_conversation_with_no_export() {
+        // -w requires -f, just like -t.
+        let command = get_command();
+        let args = command.get_matches_from(["imessage-exporter", "-w", "alice"]);
+        assert!(Options::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn cant_build_option_conversation_with_diagnostic() {
+        // -w cannot be combined with diagnostics, just like -t.
+        let command = get_command();
+        let args = command.get_matches_from(["imessage-exporter", "-d", "-w", "alice"]);
+        assert!(Options::from_args(&args).is_err());
+    }
+
+    #[test]
     fn cant_build_option_no_lazy_without_format() {
         let args = get_command().get_matches_from(["imessage-exporter", "-l"]);
         assert!(Options::from_args(&args).is_err());
@@ -1024,6 +1132,7 @@ mod arg_tests {
             platform: Platform::default(),
             ignore_disk_space: true,
             conversation_filter: None,
+            conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
         };
@@ -1056,58 +1165,56 @@ mod path_tests {
     };
     use imessage_database::util::dirs::home;
 
+    /// Build a fresh, empty tempdir unique to the calling test so parallel
+    /// runs do not race on `/tmp` and unrelated leftover files from prior
+    /// runs cannot trip `validate_path`'s same-extension check.
+    fn tempdir_for_test(test_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("imessage_path_test_{test_name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn can_validate_empty() {
-        // Cleanup existing temp data
-        let _ = fs::remove_file("/tmp/orphaned.txt");
-
-        let tmp = String::from("/tmp");
-        let export_path = Some(&tmp);
+        let dir = tempdir_for_test("can_validate_empty");
+        let dir_str = dir.to_string_lossy().into_owned();
         let export_type = Some(ExportType::Txt);
 
-        let result = validate_path(export_path, export_type.as_ref());
+        let result = validate_path(Some(&dir_str), export_type.as_ref());
 
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp"));
+        assert_eq!(result.unwrap(), dir);
     }
 
     #[test]
     fn can_validate_different_type() {
-        // Cleanup existing temp data
-        let _ = fs::remove_file("/tmp/orphaned.txt");
-
-        let tmp = String::from("/tmp");
-        let export_path = Some(&tmp);
-        let export_type = Some(ExportType::Txt);
-
-        let result = validate_path(export_path, export_type.as_ref());
-
-        let mut tmp = PathBuf::from("/tmp");
-        tmp.push("fake1.html");
-        let mut file = fs::File::create(&tmp).unwrap();
+        let dir = tempdir_for_test("can_validate_different_type");
+        // A pre-existing file of a *different* extension must not trip the
+        // same-type check.
+        let mut other_ext = dir.clone();
+        other_ext.push("fake1.html");
+        let mut file = fs::File::create(&other_ext).unwrap();
         file.write_all(&[]).unwrap();
 
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp"));
-        fs::remove_file(&tmp).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
+        let result = validate_path(Some(&dir_str), Some(&ExportType::Txt));
+
+        assert_eq!(result.unwrap(), dir);
     }
 
     #[test]
     fn can_validate_same_type() {
-        // Cleanup existing temp data
-        let _ = fs::remove_file("/tmp/orphaned.txt");
-
-        let tmp = String::from("/tmp");
-        let export_path = Some(&tmp);
-        let export_type = Some(ExportType::Txt);
-
-        let result = validate_path(export_path, export_type.as_ref());
-
-        let mut tmp = PathBuf::from("/tmp");
-        tmp.push("fake2.txt");
-        let mut file = fs::File::create(&tmp).unwrap();
+        let dir = tempdir_for_test("can_validate_same_type");
+        // A pre-existing file of the *same* extension must trip the check.
+        let mut same_ext = dir.clone();
+        same_ext.push("fake2.txt");
+        let mut file = fs::File::create(&same_ext).unwrap();
         file.write_all(&[]).unwrap();
 
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp"));
-        fs::remove_file(&tmp).unwrap();
+        let dir_str = dir.to_string_lossy().into_owned();
+        let result = validate_path(Some(&dir_str), Some(&ExportType::Txt));
+
+        assert!(result.is_err(), "expected error, got: {:?}", result);
     }
 
     #[test]

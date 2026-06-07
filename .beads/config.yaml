@@ -1,0 +1,9 @@
+# Beads Project Configuration
+issue_prefix: imessage-exporter
+default_priority: 2
+default_type: task
+
+# Sync behavior
+sync:
+  auto_import: true
+  auto_flush: true

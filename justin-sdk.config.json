@@ -1,0 +1,16 @@
+{
+  "version": "0.5.0",
+  "components": [
+    "base-setup",
+    "gitignore-setup",
+    "prettier-setup",
+    "tsconfig-setup",
+    "eslint-setup",
+    "husky-setup",
+    "gh-actions-setup",
+    "prompts-setup",
+    "claude-md-setup",
+    "beads-setup"
+  ],
+  "lastSynced": "2026-06-06"
+}
