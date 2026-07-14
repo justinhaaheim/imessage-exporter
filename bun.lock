@@ -5,7 +5,7 @@
     "": {
       "name": "imessage-exporter",
       "devDependencies": {
-        "@justinhaaheim/justin-sdk": "github:justinhaaheim/justin-sdk#0.5.0",
+        "@justinhaaheim/justin-sdk": "github:justinhaaheim/justin-sdk#v0.7.0",
         "@types/bun": "latest",
         "eslint": "9.31.0",
         "eslint-config-jha-react-node": "github:justinhaaheim/eslint-config-jha-react-node",
@@ -87,7 +87,7 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
-    "@justinhaaheim/justin-sdk": ["@justinhaaheim/justin-sdk@github:justinhaaheim/justin-sdk#544a392", { "dependencies": { "yargs": "^18.0.0" }, "bin": { "justin-sdk": "./src/cli.ts", "jsdk": "./src/cli.ts", "j": "./src/cli.ts" } }, "justinhaaheim-justin-sdk-544a392", "sha512-zhVVl8cYpLJsO15Kmhpt4UDvvRFpfha6lF5kMPnrV68z/+tgJDcRLjTD95ejXdBlLMKQAmXYFIMGB7wP2PF3Qg=="],
+    "@justinhaaheim/justin-sdk": ["@justinhaaheim/justin-sdk@github:justinhaaheim/justin-sdk#42c0ed4", { "dependencies": { "yargs": "^18.0.0" }, "bin": { "justin-sdk": "./src/cli.ts", "jsdk": "./src/cli.ts", "j": "./src/cli.ts" } }, "justinhaaheim-justin-sdk-42c0ed4", "sha512-1lUk+VoSMFiQ5JmnMNExhc1sR5SNbQWeM8mptNgXYWIJVb6I65lcS7Qt59RpiSXzj4PicoPWn97Qu389xSt6Bw=="],
 
     "@nodelib/fs.scandir": ["@nodelib/fs.scandir@2.1.5", "", { "dependencies": { "@nodelib/fs.stat": "2.0.5", "run-parallel": "^1.1.9" } }, "sha512-vq24Bq3ym5HEQm2NKCr3yXDwjc7vTsEThRDnkp2DK9p1uqLR+DHurm/NOTo0KG7HYHU7eppKZj3MyqYuMBf62g=="],
 
