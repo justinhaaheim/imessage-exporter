@@ -6,10 +6,7 @@
 
 ## Tooling
 
-This project uses the standard justin-sdk toolchain. See:
-
-- @docs/prompts/IMPORTANT_GUIDELINES_INLINED.md — coding guidelines for AI agents
-- @AGENTS.md — agent-facing tooling reference (beads, signal, doctor)
+This project uses the standard justin-sdk toolchain.
 
 Quick commands:
 
@@ -19,5 +16,3 @@ Quick commands:
 ## Notes
 
 <!-- Project-specific notes, decisions, gotchas, links. -->
-
-@docs/prompts/BEADS.md
