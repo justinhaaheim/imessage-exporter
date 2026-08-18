@@ -4,12 +4,12 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "setup-env": "bun scripts/setup-env.ts",
-    "signal": "bunx justin-sdk signal --quiet",
-    "signal:verbose": "bunx justin-sdk signal",
-    "signal:serial": "bunx justin-sdk signal --serial",
-    "doctor": "bunx justin-sdk doctor",
-    "doctor:fix": "bunx justin-sdk doctor --fix",
+    "setup-env": "bunx @justinhaaheim/justin-sdk setup-env",
+    "signal": "bunx @justinhaaheim/justin-sdk signal --quiet",
+    "signal:verbose": "bunx @justinhaaheim/justin-sdk signal",
+    "signal:serial": "bunx @justinhaaheim/justin-sdk signal --serial",
+    "doctor": "bunx @justinhaaheim/justin-sdk doctor",
+    "doctor:fix": "bunx @justinhaaheim/justin-sdk doctor --fix",
     "signal-source:TS": "tsc --noEmit",
     "signal-source:LINT": "eslint --report-unused-disable-directives --max-warnings 0 .",
     "signal-source:PRETTIER": "prettier --check .",
@@ -19,7 +19,8 @@
     "lint": "bun run lint-base -- .",
     "lint:fix": "bun run lint-base -- --fix .",
     "lint:fix:file": "bun run lint-base -- --fix",
-    "prepare": "husky"
+    "prepare": "husky",
+    "fix": "bunx @justinhaaheim/justin-sdk fix"
   },
   "devDependencies": {
     "@justinhaaheim/justin-sdk": "github:justinhaaheim/justin-sdk#v0.7.0",

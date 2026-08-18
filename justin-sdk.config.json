@@ -1,5 +1,5 @@
 {
-  "version": "0.5.0",
+  "version": "0.18.2",
   "components": [
     "base-setup",
     "gitignore-setup",
@@ -8,7 +8,27 @@
     "eslint-setup",
     "husky-setup",
     "gh-actions-setup",
-    "beads-setup"
+    "beads-setup",
+    "critical-rules-setup"
   ],
-  "lastSynced": "2026-06-06"
+  "lastSynced": "2026-08-18",
+  "componentConfig": {
+    "critical-rules": {
+      "modules": [
+        "communication",
+        "no-manual-line-wrapping",
+        "beads-workflow",
+        "stay-focused",
+        "code-style",
+        "failure-is-not-empty",
+        "do-these-first",
+        "check-signals",
+        "screenshot-tests",
+        "commit-regularly",
+        "dev-best-practices",
+        "justin-sdk",
+        "advisor-tool"
+      ]
+    }
+  }
 }
