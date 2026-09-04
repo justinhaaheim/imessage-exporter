@@ -1,4 +1,4 @@
-<!-- justin-sdk rules · commit 8bf551ed402e · content a727f2544cd1 · generated 2026-08-18 · GENERATED FILE — do not edit; run: bunx @justinhaaheim/justin-sdk rules-update -->
+<!-- justin-sdk rules · commit 44c79b132676 · content 141785f0b240 · generated 2026-09-04 · GENERATED FILE — do not edit; run: bunx @justinhaaheim/justin-sdk rules-update -->
 
 # Critical Rules
 
@@ -9,30 +9,20 @@ Before yielding back after work has been completed:
 - ALWAYS explicitly describe what specific testing steps should be taken to test the changes that were just made, when appropriate.
 - ALWAYS provide a short description of what to suggest working on next.
 
-# 2. NEVER hand-wrap prose
+**Flag contradictory, duplicated, or stale content in CLAUDE.md and other memory/rules files as soon as you notice it.** I cannot see it, and it may be steering you toward behavior I don't want. File a bead and offer to fix it: "I noticed X and Y contradict each other in CLAUDE.md — filed `<id>`. Want me to handle it now?" The `memory-cleanup` skill covers what belongs where.
 
-**Do not insert your own newlines to wrap a paragraph at some column width.** One paragraph = one line in the source. One bullet = one line in the source. Let the thing that displays the text do the wrapping.
+# 2. Development Best Practices
 
-This applies to **everything you write**, not just code files: markdown documents (reports, briefings, design docs, READMEs, journal entries); issue-tracker fields (beads descriptions, notes, acceptance criteria, close reasons; GitHub/Linear issues and comments); email bodies; commit message bodies; chat messages, PR descriptions, and anything else prose-shaped.
-
-## 2.1 Why
-
-Hard-wrapping bakes ONE column width into the content forever: a narrower viewport gets doubly-wrapped, ragged text; a wider one gets a text column stranded in whitespace. It breaks worst exactly where Justin actually reads things — a phone, a narrow editor pane, the Reminders app, the Gmail mobile client. It also corrupts diffs: reflowing a hand-wrapped paragraph after a small edit rewrites every line in it, so one changed word shows up as a whole changed paragraph.
-
-## 2.2 What this does NOT mean
-
-This is not "avoid all newlines." Structural line breaks are correct and expected: blank lines between paragraphs; one line per list item, table row, or block-quote line; headings, code fences, and the lines inside a code block (code has real line semantics — wrap code however the language and formatter want); deliberate hard breaks where the break is part of the meaning (addresses, poetry, ASCII diagrams, signature blocks, checklists).
-
-The rule is narrow and specific: **never break a line purely because it got long.**
-
-## 2.3 Formatter settings
-
-Prettier's `proseWrap` defaults to `"preserve"` — it keeps whatever you wrote, so it will neither rescue you from hand-wrapping nor introduce it. Where a project's Prettier config is under your control, set it explicitly (`{"proseWrap": "preserve"}`) so the default can never drift. Never set `proseWrap: "always"` — that is the formatter doing the exact thing this rule forbids.
-
-## 2.4 In practice
-
-- **Email is where this shows worst.** Hard-wrapped ~70-character lines render as ragged, broken-looking paragraphs in both the Gmail web and mobile clients. Write each paragraph as one long line, separated by blank lines, with no HTML paragraph markup.
-- You will feel a pull to wrap at ~80 or ~100 characters because source code looks tidier that way. Prose is not source code — resist it. And if a file you are editing already contains hand-wrapped prose, **unwrap the paragraphs you touch** rather than matching the existing broken style.
+- **When making decisions and evaluating options, rely on credible research, experiments and data whenever possible.** Challenge claims (including claims in your own reasoning) if they are vague, overconfident or unsupported.
+  - **Never present conjecture as fact.** Always explicitly name speculation and uncertainty as such. This is an essential part of rigorous reasoning.
+- **Prefer using existing libraries over writing hand-rolled code.** A mature library typically brings better edge-case handling, standards compliance, API design, and bug finding/fixing. It keeps our local code simpler/smaller. Vet the libraries first, though: look at project age, recent maintenance cadence, and adoption/GitHub stars — and when in doubt, dispatch a subagent to clone and inspect the code.
+- **Run shell commands one at a time.** One logical action per invocation; read its output before deciding the next command. Do NOT chain multiple state-changing steps into a single compound command: if any step fails mid-chain the failure is buried, the partial state is hard to see, and recovery is a mess. Sequential commands cost nothing and make every result inspectable. Shell plumbing within one action is fine (pipes, a guard like `test -f x && …`) — the smell is stacking independent actions, especially writes, behind a single Enter.
+- **Use a `./tmp/` folder** for genuinely disposable files — scratch data, backups, throwaway output — and keep `tmp/` in `.gitignore` so the working tree stays clean.
+- **Never leave CODE in `tmp/`.** Anything with reuse value goes in the repo proper, from the first version. `tmp/` is excluded from TypeScript, ESLint and Prettier, so code there is silently unchecked, and the directory is liable to be cleared at any moment. Commit it and prune later if it turns out not to matter — that is far cheaper than losing it or shipping something nothing ever type-checked.
+- **Create, enter, and exit git worktrees with the Claude Code worktree tools, not raw `git worktree` commands.** Removing a worktree by hand leaves its Claude transcript stranded in an orphaned project directory, where `--resume` will not find it; the tools move it back. Raw removal also destroys any unpushed commits and submodule state living in that worktree.
+- **Codify reusable commands as `package.json` scripts.** Anything worth running more than once — even a memorable one-off — becomes a named script rather than living only in chat or shell history. Predictable aliases (`prettier:write`, `fix`, etc.) document the command explicitly for humans and agents, remove the recall cost of bespoke per-tool syntax, and are discoverable via shell completion (an ADHD-ergonomics win). Whenever you hand over a command to run, lean toward adding it as a script first, then saying to run `bun run <name>`. Even non-JS projects should keep a `package.json` for these aliases. Prefix disposable one-offs with `tmp:` (e.g. `tmp:fetch-otter-april`) so they're visibly throwaway and easy to garbage-collect, while still committed to git as a record of the exact invocation.
+- **Write scripts in TypeScript rather than shell script**, run them with `bun`, and put them in a `/scripts/` folder. TypeScript is more readable and adds static typing, so prefer it unless a shell script has clear advantages.
+- **NEVER use "barrel files" or the "directory index pattern".** Barrel files are `index.{js|ts|jsx|tsx}` files that only re-export other modules; the directory index pattern is creating a directory with an index file where a single module file would suffice (use `module.ts`, not `module/index.ts`). ALWAYS import modules directly from their specific file. Exception: only use index files where the framework requires them (e.g. Expo Router pages).
 
 # 3. Use beads for planning and tracking
 
@@ -42,7 +32,7 @@ I use [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) as th
 
 ## 3.1 Why this matters
 
-Context evaporates between sessions: chat history is gone, file diffs are lossy, and memory is fragile. Beads are the durable, externalized memory that survives — the accountability, trackability, and audit trail that outlast the conversation — so use them **rigorously**. Capture in beads:
+Context evaporates between sessions: chat history is gone, file diffs are lossy, and memory is fragile. Beads are the durable, externalized memory that survives — the accountability, trackability, and audit trail that outlast the conversation — so use them **rigorously**. Capture in the bead's own body fields (see **Keep the bead current** below):
 
 - **Decisions** made, and the reasoning behind them.
 - **Anti-decisions** — approaches considered and deliberately rejected, and why.
@@ -54,7 +44,17 @@ Context evaporates between sessions: chat history is gone, file diffs are lossy,
 
 **Acceptance criteria are essential — use them almost always.** Roughly half the value of a bead is its acceptance criteria: they define, concretely, what "fully complete" means in the way the human intended. Without them it is far too easy to do work that merely _sounds like_ the bead's title, declare it done, and close it — while missing what the human actually asked for. Write them when you create the bead, and treat them as the definition of done.
 
-## 3.2 When you start work
+## 3.2 Keep the bead current — the body is the only source of truth
+
+A bead's **title and body fields** (`description`, `design`, `acceptance_criteria`, `notes`) are the source of truth for the spec and for the state of the work. Everything listed above goes there, and nowhere else.
+
+- **They must always be accurate.** A bead is not a log of what was once believed — it describes the problem, the plan, and the status **as currently understood**. Keeping them current is critically important: a body that has gone stale actively misleads the next session, which is worse than no bead at all. Keep the title and body in sync with each other, too; a title that no longer matches the body is itself a bug.
+- **Rewrite freely — removing is not destroying.** Do NOT hesitate to change or delete anything inside a bead. Beads are tracked in git, so every prior version stays recoverable: **git history is the changelog; the body is the present tense.** Preserving a predecessor's superseded text out of deference is the failure mode here, not the careful choice.
+- **Prune aggressively.** More information is not better when it is stale, superseded, confusing, misleading, or irrelevant — cut it. The goal is that the bead is an accurate representation, at all times, of the work to be done given the current understanding of the project.
+- **Anything changes → update the title and the body, now.** A decision reversed, a spec revised, a question answered, a hypothesis ruled out: rewrite the affected fields in place so they read correctly to someone who has never seen an earlier version. Recording an abandoned approach as an anti-decision is valuable — write it as current knowledge ("X was tried and rejected because Y"), not as an append-only trail under text that still describes X as the plan.
+- **Do NOT use comments.** Never `br comments add` (decided by Justin, 2026-09-04). Comments are not surfaced by `br show` or `br list`, so anything filed there is invisible in practice — and treating them as an equally good home for updates is precisely what let spec reversals accumulate as comments while bead bodies went on describing designs that had already been abandoned. Everything that matters goes in the body; what does not matter goes nowhere. The two cases that feel like they need a comment are already covered: `br close --reason "…"` writes the `close_reason` field, and a reason for reopening goes in `notes`.
+
+## 3.3 When you start work
 
 Before doing anything, decide which case you're in:
 
@@ -84,19 +84,19 @@ Before doing anything, decide which case you're in:
    br update <id> --status=in_progress   # claim it
    ```
 
-## 3.3 During work
+## 3.4 During work
 
 - Update bead status as you go: `in_progress` when claimed, `closed` with a `--reason` when done.
 - **Carefully review the acceptance criteria before closing a bead** — confirm the work genuinely meets every criterion, not just the bead's title.
 - Discover a follow-up task? Create it: `br create "..." -t task -p N` (add `--parent EPIC` if it belongs to one).
-- Surprises, decisions, dead-ends worth remembering — append to the bead's `notes` field (`br update <id> --notes ...`) or add a comment on the bead; either is fine. The bead is the durable memory; chat history is not.
+- Surprises, decisions, dead-ends worth remembering — write them into the bead's `notes` field (`br update <id> --notes '...'`), rewriting the field so it reads as the current state of the work rather than a transcript of how you got there. `--notes` REPLACES what's there, which is the point: read the existing note, fold in what's new, cut what's now stale. The bead is the durable memory; chat history is not.
 
-## 3.4 When you finish (or hit a stopping point)
+## 3.5 When you finish (or hit a stopping point)
 
 - The `.beads/` directory IS the source of truth, and most projects **auto-flush** it to `.beads/issues.jsonl`. **But you must remember to COMMIT that file** — it happens often that beads get changed and then left uncommitted. Stage and commit it alongside your code changes so beads state travels with the branch.
-- If the work is a multi-bead epic and you're handing off mid-stream, give a **short handoff message** for the next agent: the epic id, the branch, what's done, and what's next (which bead to claim).
+- If the work is a multi-bead epic and you're handing off mid-stream, give a **short handoff message** for the next agent: the epic id, the branch, what's done, and what's next (which bead to claim). The message is a pointer, not the record — the detail must already be in the bead bodies, since the message is gone the moment the session is.
 
-## 3.5 Notes
+## 3.6 Notes
 
 - If beads doesn't appear to be set up in a project, do NOT run `br init` yourself — flag it to the human instead ("my guidance says to use beads, but it doesn't look set up here yet").
 - Beads are local to a branch / worktree. To see beads created in a worktree you must `cd` into that worktree first — if you've been told to work on a bead in a particular worktree, check out that worktree before running any `br` commands.
@@ -185,43 +185,52 @@ When building UI in a project that has no screenshot tests yet, suggest setting 
 - ALWAYS commit changes proactively, at regular intervals, as soon as a unit of work is done.
 - NEVER leave uncommitted changes in the working directory. It is better to commit now and fix any issues in follow-up commits than to leave uncommitted changes in the working directory.
 
-# 11. Development Best Practices
-
-- **Prefer using existing libraries over writing hand-rolled code.** A mature library typically brings better edge-case handling, standards compliance, API design, and bug finding/fixing. It keeps our local code simpler/smaller. Vet the libraries first, though: look at project age, recent maintenance cadence, and adoption/GitHub stars — and when in doubt, dispatch a subagent to clone and inspect the code.
-- **Run shell commands one at a time.** One logical action per invocation; read its output before deciding the next command. Do NOT chain multiple state-changing steps into a single compound command: if any step fails mid-chain the failure is buried, the partial state is hard to see, and recovery is a mess. Sequential commands cost nothing and make every result inspectable. Shell plumbing within one action is fine (pipes, a guard like `test -f x && …`) — the smell is stacking independent actions, especially writes, behind a single Enter.
-- **Use a `./tmp/` folder** for any temporary, backup, or scratch files, and keep `tmp/` in `.gitignore` — the working tree stays clean and cleanup is easy.
-- **Codify reusable commands as `package.json` scripts.** Anything worth running more than once — even a memorable one-off — becomes a named script rather than living only in chat or shell history. Predictable aliases (`prettier:write`, `fix`, etc.) document the command explicitly for humans and agents, remove the recall cost of bespoke per-tool syntax, and are discoverable via shell completion (an ADHD-ergonomics win). Whenever you hand over a command to run, lean toward adding it as a script first, then saying to run `bun run <name>`. Even non-JS projects should keep a `package.json` for these aliases. Prefix disposable one-offs with `tmp:` (e.g. `tmp:fetch-otter-april`) so they're visibly throwaway and easy to garbage-collect, while still committed to git as a record of the exact invocation.
-- **Write more complex scripts in TypeScript**, run them with `bun`, and put them in a `/scripts/` folder. TypeScript is more readable and adds static typing, so prefer it unless a shell script has clear advantages.
-- **NEVER use "barrel files" or the "directory index pattern".** Barrel files are `index.{js|ts|jsx|tsx}` files that only re-export other modules; the directory index pattern is creating a directory with an index file where a single module file would suffice (use `module.ts`, not `module/index.ts`). ALWAYS import modules directly from their specific file. Exception: only use index files where the framework requires them (e.g. Expo Router pages).
-
-# 12. Justin SDK
+# 11. Justin SDK
 
 **justin-sdk** (`@justinhaaheim/justin-sdk`) provides useful tools in a consistent way across many different projects. Its whole purpose is to avoid rolling my own near-duplicate scripts in virtually every project — and then having to keep all those copies in sync.
 
-## 12.1 Prefer uniformity across projects over matching local code
+## 11.1 Prefer uniformity across projects over matching local code
 
 For tooling that exists (or should exist) in more than one of my projects — build/ship scripts, config, shared helpers — **strive for uniform, ideally identical, patterns across similar projects**. Do NOT default to "match the surrounding code" of whichever project you happen to be in.
 
 "Match the surrounding code" is a _within-a-project_ tiebreaker for idiom and naming. It is NOT a reason to let the same tool diverge into a different local dialect from one project to the next. If a shared script doesn't lint/typecheck/build in some project, the right fix is to make that project support the shared version (e.g. add the types it needs to its tsconfig), NOT to fork the script.
 
-## 12.2 Consolidate shared functionality into justin-sdk
+## 11.2 Consolidate shared functionality into justin-sdk
 
 When there's an opportunity to consolidate similar functionality used across projects _into_ justin-sdk, that is usually the right choice: reusing one implementation from the SDK is **strictly better** than copy-pasting it into N projects and keeping the copies in sync. Some things genuinely may not work (or not work as well) inside the justin-sdk package itself — keep those per-project, but still uniform across projects. Most of the time that isn't the case, so put it in justin-sdk and reuse it.
 
-# 13. Advisor tool
+# 12. Advisor tool
 
-The `advisor` tool is a stronger reviewer model that gives feedback on designs, implementations, and problems you're stuck on. It sees the whole history — the task, every tool call and result, your reasoning — all forwarded automatically.
+The `advisor` tool is a stronger reviewer model that gives feedback on designs, implementations, and problems you're stuck on. It sees the whole conversation history automatically.
 
-**When to consult it:** BEFORE substantive work (before writing/editing/committing to an interpretation), when you believe the task is complete, when you're stuck, and when you're considering a change of approach.
+When to use the advisor:
 
-**Give its advice serious weight**, but adapt if a step fails empirically or primary-source evidence contradicts it.
+- After scoping/designing a significant feature/workstream, ask the advisor to review your spec/approach before implementing -- to identify and challenge your assumptions, and to provide constructive feedback.
+- If you are stuck debugging something ask the advisor for help before spending too much time spinning your wheels.
+- If you are considering pivoting to a different approach, but are uncertain about which approach to take or whether to pivot in the first place, ask the advisor to think it through with you.
 
-**Advisor feedback must NEVER cause you to deviate from the instructions or specifications the human gave you** — follow those precisely. The advisor exists to help you achieve the spec, not to alter it. If it flags a problem or offers an alternate approach that would mean deviating, you MUST get explicit approval from the human before making any deviation.
+When to NOT use the advisor:
 
-## 13.1 If the advisor tool is unavailable
+- When you are making small or simple changes.
+- When the task is already clearly scoped.
+- When the task has little ambiguity.
+- When the approach follows well-established patterns.
+- When the changes are easily reversible, straightforward, and entail little-to-no risk.
 
-Fall back to spawning a subagent as the advisor, and treat it exactly the same way.
+Important: **Advisor feedback must NEVER cause you to deviate from the instructions or specifications the human gave you** — follow those precisely. The advisor exists to help you achieve the spec, not to alter it. If it flags a problem or offers an alternate approach that would mean deviating, you MUST get explicit approval from the human before making any deviation.
 
-1. **Package the context.** A subagent does NOT inherit the conversation transcript — the `advisor` tool's key feature — so hand it everything it needs: the task/goal, what's been done so far (key tool calls + results), your current reasoning/plan, the relevant files or diffs, and the specific question to review. Frame it as "review my work/plan as a skeptical senior reviewer and push back."
-2. **CONTAIN it to a single subagent session — state this EXPLICITLY in the prompt.** It must not spawn subagents of its own, and must not call the `advisor` tool itself; it answers directly within its own session and returns its review as its final message. Put this line in the prompt verbatim: _"Do NOT spawn any subagents and do NOT use any advisor tool — answer directly in this single session and return your review as your final message."_
-3. **Use a model one tier ABOVE the current main model**, passed via the Agent tool's `model` param. Ascending ladder: **`haiku` → `sonnet` → `opus` → `fable`**. If already on `fable` (the top tier), use `fable` again — a fresh, differently-anchored reviewer still adds value — and note that no higher tier was available. (Verified: `model: fable` subagents run and self-report as `claude-fable-5`.)
+## 12.1 If the advisor tool is unavailable
+
+Fall back to spawning a subagent as the advisor, and treat it the same way.
+
+1. **Package the context.** A subagent does NOT inherit the conversation transcript, so you must provide it everything it needs: the task/goal/bead id, what's been done so far (key tool calls + results), decisions/dead-ends/trade-offs, your current reasoning/plan, the relevant files or diffs, and the specific question to review. Frame it as "review my work/plan as a skeptical senior reviewer and push back."
+2. **Instruct the subagent to not spawn its own subagents or advisors.** Use this language verbatim: "Do NOT spawn any subagents and do NOT use any advisor tool — answer directly in this single session and return your review as your final message."
+3. **Use a model one tier ABOVE the current main model**, passed via the Agent tool's `model` param. Ascending ladder: **`haiku` → `sonnet` → `opus` → `fable`**. If already on `fable` (the top tier), use `fable` again — a fresh, differently-anchored reviewer still adds value.
+
+# 13. NEVER manually wrap text
+
+**Do not insert your own newlines to wrap a text at some column width.** Let the thing that displays the text do the wrapping.
+
+This is not "avoid all newlines." Structural line breaks are correct and expected. The rule is narrow and specific: **never break a line purely because it got long.**
+
+This applies to **everything you write**, not just code. Only manually wrap lines when it is explicitly called for.
