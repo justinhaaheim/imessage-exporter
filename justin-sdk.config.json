@@ -1,5 +1,5 @@
 {
-  "version": "0.18.2",
+  "version": "0.27.0",
   "components": [
     "base-setup",
     "gitignore-setup",
@@ -11,7 +11,7 @@
     "beads-setup",
     "critical-rules-setup"
   ],
-  "lastSynced": "2026-08-18",
+  "lastSynced": "2026-09-10",
   "componentConfig": {
     "critical-rules": {
       "modules": [

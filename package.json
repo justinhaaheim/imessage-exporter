@@ -20,17 +20,20 @@
     "lint:fix": "bun run lint-base -- --fix .",
     "lint:fix:file": "bun run lint-base -- --fix",
     "prepare": "husky",
-    "fix": "bunx @justinhaaheim/justin-sdk fix"
+    "fix": "bunx @justinhaaheim/justin-sdk fix",
+    "prettier:check": "prettier --check .",
+    "prettier:write": "prettier --write .",
+    "prettier:write:file": "prettier --write --ignore-unknown"
   },
   "devDependencies": {
-    "@justinhaaheim/justin-sdk": "github:justinhaaheim/justin-sdk#v0.7.0",
-    "prettier": "3.6.2",
-    "typescript": "5.9.2",
+    "@justinhaaheim/justin-sdk": "github:justinhaaheim/justin-sdk#v0.27.0",
     "@types/bun": "latest",
     "eslint": "9.31.0",
     "eslint-config-jha-react-node": "github:justinhaaheim/eslint-config-jha-react-node",
     "husky": "9.1.7",
-    "lint-staged": "16.2.7"
+    "lint-staged": "16.2.7",
+    "prettier": "3.6.2",
+    "typescript": "5.9.2"
   },
   "lint-staged": {
     "*.{ts,tsx,js,jsx,cjs,mjs}": [
