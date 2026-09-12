@@ -26,7 +26,7 @@
     "prettier:write:file": "prettier --write --ignore-unknown"
   },
   "devDependencies": {
-    "@justinhaaheim/justin-sdk": "github:justinhaaheim/justin-sdk#v0.27.0",
+    "@justinhaaheim/justin-sdk": "github:justinhaaheim/justin-sdk#v0.28.1",
     "@types/bun": "latest",
     "eslint": "9.31.0",
     "eslint-config-jha-react-node": "github:justinhaaheim/eslint-config-jha-react-node",
