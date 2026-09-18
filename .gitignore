@@ -118,7 +118,6 @@ dist-ssr/
 
 .eslintcache
 
-*.local
 *.local.json
 *.local.*
 
@@ -150,7 +149,6 @@ projects/*
 /output
 
 # OS Files
-.DS_Store
 
 
 

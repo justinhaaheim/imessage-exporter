@@ -1,5 +1,4 @@
 {
-  "version": "0.30.0",
   "components": [
     "base-setup",
     "gitignore-setup",
@@ -11,24 +10,7 @@
     "beads-setup",
     "critical-rules-setup"
   ],
-  "lastSynced": "2026-09-12",
   "componentConfig": {
-    "critical-rules": {
-      "modules": [
-        "communication",
-        "no-manual-line-wrapping",
-        "beads-workflow",
-        "stay-focused",
-        "code-style",
-        "failure-is-not-empty",
-        "do-these-first",
-        "check-signals",
-        "screenshot-tests",
-        "commit-regularly",
-        "dev-best-practices",
-        "justin-sdk",
-        "advisor-tool"
-      ]
-    }
+    "critical-rules": {}
   }
 }

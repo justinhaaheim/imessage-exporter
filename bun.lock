@@ -5,7 +5,7 @@
     "": {
       "name": "imessage-exporter",
       "devDependencies": {
-        "@justinhaaheim/justin-sdk": "github:justinhaaheim/justin-sdk#v0.30.0",
+        "@justinhaaheim/justin-sdk": "github:justinhaaheim/justin-sdk#v0.39.1",
         "@types/bun": "latest",
         "eslint": "9.31.0",
         "eslint-config-jha-react-node": "github:justinhaaheim/eslint-config-jha-react-node",
@@ -87,7 +87,7 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
-    "@justinhaaheim/justin-sdk": ["@justinhaaheim/justin-sdk@github:justinhaaheim/justin-sdk#be5e61e", { "dependencies": { "ignore": "^7.0.6", "semver": "^7.8.5", "yargs": "^18.0.0", "zod": "^4.6.1" }, "bin": { "justin-sdk": "./src/cli.ts", "jsdk": "./src/cli.ts", "j": "./src/cli.ts", "repo-status": "./src/repo-status/repo-status.ts" } }, "justinhaaheim-justin-sdk-be5e61e", "sha512-yraKu7yIWRtglLef+ffgmLmZkCkrbOBTgX94vgg5pkDtz3CbPsPwOP3OIXavoUZb5pIOy5/vS6JhjevTxWuODw=="],
+    "@justinhaaheim/justin-sdk": ["@justinhaaheim/justin-sdk@github:justinhaaheim/justin-sdk#5f0a9c7", { "dependencies": { "ignore": "^7.0.6", "semver": "^7.8.5", "yargs": "^18.0.0", "zod": "^4.6.1" }, "bin": { "justin-sdk": "./src/cli.ts", "repo-status": "./src/repo-status/repo-status.ts" } }, "justinhaaheim-justin-sdk-5f0a9c7", "sha512-pCZjTF3fWb0pp1IfJILvp0WaQ4cUaUAmw9N9ZFBr9a50xS6Zd17mit7jq1Boo2u0kYEQQLtAvj3laWr18XaOCQ=="],
 
     "@nodelib/fs.scandir": ["@nodelib/fs.scandir@2.1.5", "", { "dependencies": { "@nodelib/fs.stat": "2.0.5", "run-parallel": "^1.1.9" } }, "sha512-vq24Bq3ym5HEQm2NKCr3yXDwjc7vTsEThRDnkp2DK9p1uqLR+DHurm/NOTo0KG7HYHU7eppKZj3MyqYuMBf62g=="],
 
@@ -707,7 +707,7 @@
 
     "yocto-queue": ["yocto-queue@0.1.0", "", {}, "sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q=="],
 
-    "zod": ["zod@4.6.2", "", {}, "sha512-lh5RCAGFa1Cm2hjtNwLQhSs/AsqdWnTQaBER9fEwN/88pSh7KOtJavtBx/0VlkN/uFd61SwYmljLMDAsHlvzBQ=="],
+    "zod": ["zod@4.6.5", "", {}, "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q=="],
 
     "zod-validation-error": ["zod-validation-error@4.0.2", "", { "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" } }, "sha512-Q6/nZLe6jxuU80qb/4uJ4t5v2VEZ44lzQjPDhYJNztRQ4wyWc6VF3D3Kb/fAuPetZQnhS3hnajCf9CsWesghLQ=="],
 
