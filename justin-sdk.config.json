@@ -8,9 +8,14 @@
     "husky-setup",
     "gh-actions-setup",
     "beads-setup",
-    "critical-rules-setup"
+    "critical-rules-setup",
+    "thread-hooks-setup"
   ],
   "componentConfig": {
-    "critical-rules": {}
+    "critical-rules": {},
+    "thread": {
+      "enforce": true,
+      "startOnSessionStart": true
+    }
   }
 }
