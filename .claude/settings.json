@@ -48,6 +48,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "bun run justin-sdk thread nudge",
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      }
     ]
   },
   "claudeMdExcludes": ["/Users/jhaa/.claude/rules/justin-sdk/critical-rules.md"]
