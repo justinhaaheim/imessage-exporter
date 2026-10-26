@@ -17,15 +17,7 @@
       {
         "hooks": [
           {
-            "command": "bun run justin-sdk thread stop-check",
-            "type": "command"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "command": "bun run justin-sdk thread capture",
+            "command": "bun run --cwd \"${CLAUDE_PROJECT_DIR:-.}\" justin-sdk hook Stop",
             "type": "command"
           }
         ]
@@ -35,15 +27,7 @@
       {
         "hooks": [
           {
-            "command": "bun run justin-sdk thread capture",
-            "type": "command"
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "command": "bun run justin-sdk repo-state --hook",
+            "command": "bun run --cwd \"${CLAUDE_PROJECT_DIR:-.}\" justin-sdk hook UserPromptSubmit",
             "type": "command"
           }
         ]
@@ -53,7 +37,7 @@
       {
         "hooks": [
           {
-            "command": "bun run justin-sdk thread nudge",
+            "command": "bun run --cwd \"${CLAUDE_PROJECT_DIR:-.}\" justin-sdk hook PostToolUse",
             "type": "command"
           }
         ],
