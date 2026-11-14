@@ -9,10 +9,11 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    ffi::OsStr,
     fmt::Write as FmtWrite,
-    fs::{File, remove_file, rename},
+    fs::{File, canonicalize, metadata, remove_file, rename},
     io::{BufWriter, IsTerminal, Write, stderr},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Datelike, NaiveDate};
@@ -52,9 +53,10 @@ use imessage_database::{
 /// File name (relative to the export path) of the unified timeline output.
 pub(crate) const TIMELINE_FILENAME: &str = "timeline.md";
 
-/// File name (relative to the export path) the timeline is written to
-/// before it replaces [`TIMELINE_FILENAME`] (djf.12 F8).
-pub(crate) const TIMELINE_PARTIAL_FILENAME: &str = "timeline.md.partial";
+/// Added to the finished file's name to name the temporary file the timeline
+/// is written to before it replaces that file (djf.12 F8): normally
+/// `timeline.md.partial` in the export path (djf.16 R6).
+const PARTIAL_SUFFIX: &str = ".partial";
 
 /// Heading shown when a message has no associated chat.
 pub(crate) const ORPHANED_THREAD_LABEL: &str = "Orphaned messages (no associated chat)";
@@ -164,10 +166,12 @@ pub struct Timeline<'a> {
     /// The temporary file the unified timeline is written into. It replaces
     /// `timeline.md` only when the export succeeds (djf.12 F8).
     pub file: BufWriter<File>,
-    /// Where `file` is: [`TIMELINE_PARTIAL_FILENAME`] in the export path.
+    /// Where `file` is: next to `final_path`, named after it with
+    /// [`PARTIAL_SUFFIX`] (`timeline.md.partial` in the export path, unless
+    /// `timeline.md` links elsewhere).
     partial_path: PathBuf,
     /// Where the finished timeline goes: [`TIMELINE_FILENAME`] in the
-    /// export path.
+    /// export path, or the file it links to (djf.16 R6).
     final_path: PathBuf,
     /// Messages collected and grouped by day (BTreeMap so days come out in
     /// chronological order) then by thread.
@@ -189,14 +193,31 @@ pub struct Timeline<'a> {
 // MARK: Exporter
 impl<'a> Timeline<'a> {
     pub fn new(config: &'a Config) -> Result<Self, RuntimeError> {
-        let final_path = config.options.export_path.join(TIMELINE_FILENAME);
-        let partial_path = config.options.export_path.join(TIMELINE_PARTIAL_FILENAME);
+        let timeline_path = config.options.export_path.join(TIMELINE_FILENAME);
+
+        // djf.16 R6: renaming the new file over a timeline.md that is a
+        // symlink would replace the link with a regular file and leave its
+        // target stale, and the new file would have the default mode. So an
+        // existing timeline.md is resolved to the file it names, the new
+        // file is written next to that file, and it gets that file's mode.
+        let (final_path, previous_permissions) = if timeline_path.try_exists()? {
+            (
+                canonicalize(&timeline_path)?,
+                Some(metadata(&timeline_path)?.permissions()),
+            )
+        } else {
+            (timeline_path, None)
+        };
+        let partial_path = partial_path_for(&final_path);
 
         // djf.12 F8: write a temporary file next to timeline.md and rename
         // it over timeline.md only when the export succeeds, so a failed run
         // leaves a previous timeline.md as it was. A temporary file left by
         // a run that was killed is overwritten.
         let file = File::create(&partial_path)?;
+        if let Some(permissions) = previous_permissions {
+            file.set_permissions(permissions)?;
+        }
 
         Ok(Timeline {
             config,
@@ -851,6 +872,17 @@ impl<'a> Timeline<'a> {
 }
 
 // MARK: Free helpers
+/// The temporary file for `final_path`: in the same folder, so the rename
+/// replaces the file in one step, named after it with [`PARTIAL_SUFFIX`].
+fn partial_path_for(final_path: &Path) -> PathBuf {
+    let mut name = final_path
+        .file_name()
+        .map(OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(PARTIAL_SUFFIX);
+    final_path.with_file_name(name)
+}
+
 /// The stderr warning for a reply whose parent message cannot be read
 /// (djf.16 R8). It names the reply, which stays in the timeline.
 fn parent_lookup_warning(reply: &Message, why: &TableError) -> String {
@@ -2510,6 +2542,9 @@ mod tests {
     }
 
     // MARK: Failed exports (djf.12 F8)
+    /// The temporary file next to `timeline.md` in the export path.
+    const TIMELINE_PARTIAL_FILENAME: &str = "timeline.md.partial";
+
     /// A copy of the fixture `test.db` plus one message row that cannot be
     /// read at all: its date is text, so reading the row fails and the
     /// export stops. Text sorts after numbers, so it is read last, after the
@@ -2573,6 +2608,101 @@ mod tests {
         assert!(contents.starts_with("# "), "got:\n{contents}");
         assert!(!contents.contains("an earlier export"), "got:\n{contents}");
         assert!(!export_path.join(TIMELINE_PARTIAL_FILENAME).exists());
+    }
+
+    // MARK: Replacing timeline.md (djf.16 R6)
+    /// Export [`db_with_unreadable_message`] into `export_path`, which may
+    /// already hold a `timeline.md`.
+    fn export_into(test_name: &str, export_path: &std::path::Path) {
+        let mut options = isolated_options(test_name);
+        options.db_path = db_with_unreadable_message();
+        options.export_path = export_path.to_path_buf();
+        let config = Config::fake_app(options);
+        let mut exporter = Timeline::new(&config).unwrap();
+        exporter.iter_messages().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rerun_keeps_the_mode_of_the_previous_timeline() {
+        use std::os::unix::fs::PermissionsExt;
+        // djf.16 R6: the rename replaced a 600 timeline.md with a new file in
+        // the default mode. Two modes, so that at least one differs from the
+        // default whatever the umask.
+        let export_path = unique_test_dir("timeline-keeps-mode");
+        let probe = export_path.join("probe");
+        std::fs::write(&probe, "").unwrap();
+        let default_mode = mode_of(&probe);
+        assert!(
+            [0o600, 0o640].iter().any(|&mode| mode != default_mode),
+            "default mode {default_mode:o}"
+        );
+
+        for mode in [0o600, 0o640] {
+            let timeline = export_path.join(TIMELINE_FILENAME);
+            std::fs::write(&timeline, "an earlier export\n").unwrap();
+            std::fs::set_permissions(&timeline, std::fs::Permissions::from_mode(mode)).unwrap();
+
+            export_into(
+                "rerun_keeps_the_mode_of_the_previous_timeline",
+                &export_path,
+            );
+
+            let contents = std::fs::read_to_string(&timeline).unwrap();
+            assert!(contents.starts_with("# "), "got:\n{contents}");
+            assert_eq!(mode_of(&timeline), mode, "mode {mode:o}");
+            assert!(!export_path.join(TIMELINE_PARTIAL_FILENAME).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rerun_through_a_symlinked_timeline_keeps_the_link() {
+        // djf.16 R6: the rename replaced a symlinked timeline.md with a
+        // regular file and left the file it linked to stale.
+        let export_path = unique_test_dir("timeline-symlink-export");
+        let target_dir = unique_test_dir("timeline-symlink-target");
+        let target = target_dir.join("kept.md");
+        std::fs::write(&target, "an earlier export\n").unwrap();
+        let link = export_path.join(TIMELINE_FILENAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        export_into(
+            "rerun_through_a_symlinked_timeline_keeps_the_link",
+            &export_path,
+        );
+
+        let link_metadata = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            link_metadata.file_type().is_symlink(),
+            "the link was replaced"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        let contents = std::fs::read_to_string(&target).unwrap();
+        assert!(contents.starts_with("# "), "got:\n{contents}");
+        assert!(!contents.contains("an earlier export"), "got:\n{contents}");
+        // No temporary file is left in either folder.
+        assert!(!export_path.join(TIMELINE_PARTIAL_FILENAME).exists());
+        assert!(!target_dir.join("kept.md.partial").exists());
+    }
+
+    #[test]
+    fn partial_file_is_named_after_the_file_it_replaces() {
+        let export_path = std::path::Path::new("/exports");
+        assert_eq!(
+            partial_path_for(&export_path.join(TIMELINE_FILENAME)),
+            export_path.join(TIMELINE_PARTIAL_FILENAME)
+        );
+        assert_eq!(
+            partial_path_for(std::path::Path::new("/elsewhere/kept.md")),
+            std::path::Path::new("/elsewhere/kept.md.partial")
+        );
     }
 
     // MARK: Block-start escape (djf.9, djf.12 F1)
