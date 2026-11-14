@@ -377,11 +377,26 @@ impl<'a> Timeline<'a> {
     /// (djf.12 F8). A rename within one directory replaces the old file in
     /// one step, so `timeline.md` is never half written.
     fn finish(&mut self) -> Result<(), RuntimeError> {
+        self.finish_with(File::sync_all)
+    }
+
+    /// [`Self::finish`], with `sync` asking the system to put the file on
+    /// disk. The file is complete once flushed, so a failed `sync` is a
+    /// warning and the rename still happens (djf.16 R7): failing would throw
+    /// away a finished export over a step that only guards against a crash
+    /// or power loss in the next moments.
+    fn finish_with(
+        &mut self,
+        sync: impl FnOnce(&File) -> std::io::Result<()>,
+    ) -> Result<(), RuntimeError> {
         self.file.flush().map_err(RuntimeError::DiskError)?;
-        self.file
-            .get_ref()
-            .sync_all()
-            .map_err(RuntimeError::DiskError)?;
+        if let Err(why) = sync(self.file.get_ref()) {
+            eprintln!(
+                "Warning: could not confirm that {} reached the disk: {why}. Saving it as {} anyway.",
+                self.partial_path.display(),
+                self.final_path.display()
+            );
+        }
         rename(&self.partial_path, &self.final_path).map_err(RuntimeError::DiskError)
     }
 
@@ -2607,6 +2622,28 @@ mod tests {
         let contents = std::fs::read_to_string(export_path.join(TIMELINE_FILENAME)).unwrap();
         assert!(contents.starts_with("# "), "got:\n{contents}");
         assert!(!contents.contains("an earlier export"), "got:\n{contents}");
+        assert!(!export_path.join(TIMELINE_PARTIAL_FILENAME).exists());
+    }
+
+    #[test]
+    fn failed_sync_still_saves_the_timeline() {
+        // djf.16 R7: a failing sync_all used to fail the export and throw
+        // away the finished timeline.
+        let options = isolated_options("failed_sync_still_saves_the_timeline");
+        let export_path = options.export_path.clone();
+        let config = Config::fake_app(options);
+        let mut exporter = Timeline::new(&config).unwrap();
+        exporter.file.write_all(b"# finished\n").unwrap();
+
+        exporter
+            .finish_with(|_| Err(std::io::Error::other("injected sync failure")))
+            .unwrap();
+        drop(exporter);
+
+        assert_eq!(
+            std::fs::read_to_string(export_path.join(TIMELINE_FILENAME)).unwrap(),
+            "# finished\n"
+        );
         assert!(!export_path.join(TIMELINE_PARTIAL_FILENAME).exists());
     }
 
