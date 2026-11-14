@@ -58,6 +58,10 @@ pub(crate) const EDITED_MARKER: &str = "*(edited)*";
 /// Shown for an app message whose balloon cannot be rendered and that has no text.
 pub(crate) const APP_MESSAGE_PLACEHOLDER: &str = "[App message]";
 
+/// U+FFFC, which Messages puts in a message's text where an attachment or an
+/// app balloon sits.
+const OBJECT_REPLACEMENT_CHAR: char = '\u{FFFC}';
+
 // MARK: ThreadKey
 /// Key used to group messages by thread within a single day.
 ///
@@ -694,12 +698,19 @@ fn slice_text_for_bubble(text: &str, attributes: &[AttributedRange]) -> String {
 /// The timeline's output for an app message before balloons were rendered:
 /// the message text in italics, or `*[App message]*` when there is none.
 /// Used when upstream's balloon dispatcher returns an error.
+///
+/// Text made only of object-replacement characters and whitespace counts as
+/// none (djf.10): an app message's text is often a lone U+FFFC, which would
+/// otherwise print as an italic invisible character.
 fn app_message_fallback(msg: &Message) -> String {
     let label = msg
         .text
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| {
+            !s.chars()
+                .all(|c| c == OBJECT_REPLACEMENT_CHAR || c.is_whitespace())
+        })
         .unwrap_or(APP_MESSAGE_PLACEHOLDER);
     format!("*{label}*")
 }
@@ -1477,6 +1488,52 @@ mod tests {
         assert_eq!(
             exporter.format_timeline_message(&url_no_text).unwrap(),
             "**5:29:42 PM — Me**\n\n*[App message]*\n\n"
+        );
+    }
+
+    #[test]
+    fn unreadable_app_balloon_with_only_a_replacement_char_shows_the_placeholder() {
+        // djf.10: an app message's text is often a lone U+FFFC, which is not
+        // whitespace, so it used to print as an invisible `*￼*`.
+        let config = seeded_config(
+            "unreadable_app_balloon_with_only_a_replacement_char_shows_the_placeholder",
+        );
+        let exporter = Timeline::new(&config).unwrap();
+
+        let only_char = app_message(
+            MISSING_ROW,
+            "timeline-test-fffc",
+            OPENTABLE_BUNDLE,
+            Some("\u{FFFC}"),
+        );
+        let char_and_spaces = app_message(
+            MISSING_ROW,
+            "timeline-test-fffc-spaces",
+            OPENTABLE_BUNDLE,
+            Some(" \u{FFFC}\u{FFFC} \n"),
+        );
+        // Real text next to the character is still shown, as before.
+        let char_and_text = app_message(
+            MISSING_ROW,
+            "timeline-test-fffc-text",
+            OPENTABLE_BUNDLE,
+            Some("\u{FFFC}hello"),
+        );
+        for message in [&only_char, &char_and_spaces, &char_and_text] {
+            assert!(render_app_balloon(&config, message, &[]).is_err());
+        }
+
+        assert_eq!(
+            exporter.format_timeline_message(&only_char).unwrap(),
+            "**5:29:42 PM — Me**\n\n*[App message]*\n\n"
+        );
+        assert_eq!(
+            exporter.format_timeline_message(&char_and_spaces).unwrap(),
+            "**5:29:42 PM — Me**\n\n*[App message]*\n\n"
+        );
+        assert_eq!(
+            exporter.format_timeline_message(&char_and_text).unwrap(),
+            "**5:29:42 PM — Me**\n\n*\u{FFFC}hello*\n\n"
         );
     }
 
