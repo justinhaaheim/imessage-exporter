@@ -8,7 +8,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as FmtWrite,
     fs::{File, remove_file, rename},
     io::{BufWriter, IsTerminal, Write, stderr},
@@ -20,7 +20,6 @@ use chrono::{DateTime, Datelike, NaiveDate};
 use crate::{
     app::{
         error::RuntimeError,
-        export_type::ExportType,
         progress::ExportProgress,
         runtime::{Config, ORPHANED, UNKNOWN},
         zone::Zone,
@@ -42,6 +41,7 @@ use imessage_database::{
     tables::{
         attachment::Attachment,
         chat::Chat,
+        chat_handle::Participant,
         messages::{
             Message,
             models::{AttributedRange, BubbleComponent, GroupAction},
@@ -69,6 +69,10 @@ pub(crate) const APP_MESSAGE_PLACEHOLDER: &str = "[App message]";
 /// U+FFFC, which Messages puts in a message's text where an attachment or an
 /// app balloon sits.
 const OBJECT_REPLACEMENT_CHAR: char = '\u{FFFC}';
+
+/// Separator between participant names in a thread heading, the same one
+/// upstream's `Config::filename` puts between names in a file name.
+const PARTICIPANT_SEPARATOR: &str = ", ";
 
 /// Shown for an attachment range with no matching attachment row.
 const ATTACHMENT_MISSING_LABEL: &str = "*[Attachment: missing]*";
@@ -121,12 +125,13 @@ struct ThreadEntry {
 // MARK: ThreadLabels
 /// Thread headings already computed, keyed by chat rowid.
 ///
-/// The heading comes from upstream's `Config::filename`, which prints
-/// "Found error: message chat ID N has no members!" each time it runs for a
-/// chat with no participants. The TXT and HTML exporters call it once per
-/// chat, so the timeline caches the heading and calls it once per chat too
-/// (djf.5). Keyed by the chat row passed to `Config::filename`, so every
-/// heading is exactly what an uncached call would return.
+/// The heading comes from [`chat_display_label`], which, like upstream's
+/// `Config::filename`, prints "Found error: message chat ID N has no
+/// members!" each time it runs for a chat with no participants. The TXT and
+/// HTML exporters call `Config::filename` once per chat, so the timeline
+/// caches the heading and computes it once per chat too (djf.5). Keyed by
+/// the chat row passed to [`chat_display_label`], so every heading is
+/// exactly what an uncached call would return.
 #[derive(Default)]
 struct ThreadLabels {
     by_chat: HashMap<i32, String>,
@@ -1074,27 +1079,52 @@ fn blockquote(text: &str) -> String {
     out
 }
 
-/// Compute the chat label used as the H2 heading for a thread.
+/// Compute the chat label used as the H2 heading for a thread (djf.12 F10).
 ///
-/// Reuses `Config::filename` to pick up the same display-name-vs-participants
-/// logic the per-chat exporters use, then strips the trailing extension
-/// (e.g. ".md") so the heading reads naturally.
+/// The heading names a conversation the way upstream's `Config::filename`
+/// names its file, but whole. It is built from the conversation's
+/// representative chat row, which every row of a merged conversation is
+/// named after:
+///
+/// - its display name, then ` - ` and the deduplicated chat ID, as in the
+///   file name, so two groups with the same name stay apart;
+/// - else its participants' names, each person once, joined with `, `;
+/// - else its chat identifier, after upstream's "has no members" warning.
+///
+/// Unlike a file name, the heading is never shortened to fit the export path
+/// and keeps characters such as `/` and `:`, so it does not depend on `-o`.
+/// A line break in a name becomes a space, because a heading is one line.
+/// Headings are cached per chat (djf.5), so the warning prints once per
+/// chat, as `Config::filename` prints it once per chat for TXT and HTML.
 pub(crate) fn chat_display_label(config: &Config, chatroom: &Chat) -> String {
-    let mut name = config.filename(chatroom);
-    let extensions: [&str; 3] = [
-        ExportType::Timeline.extension(),
-        ExportType::Txt.extension(),
-        ExportType::Html.extension(),
-    ];
-    for ext in extensions {
-        if let Some(stripped) = name.strip_suffix(ext) {
-            name = stripped.to_string();
-            break;
-        }
-    }
+    let chatroom = config
+        .chat_representatives
+        .get(&chatroom.rowid)
+        .and_then(|representative| config.chatrooms.get(representative))
+        .unwrap_or(chatroom);
+
+    let name = match chatroom.display_name() {
+        Some(name) => format!(
+            "{name} - {}",
+            config
+                .real_chatrooms
+                .get(&chatroom.rowid)
+                .unwrap_or(&chatroom.rowid)
+        ),
+        None => match config.chatroom_participants.get(&chatroom.rowid) {
+            Some(participants) => participant_names(config, participants),
+            None => {
+                eprintln!(
+                    "Found error: message chat ID {} has no members!",
+                    chatroom.rowid
+                );
+                chatroom.chat_identifier.clone()
+            }
+        },
+    };
     if name.is_empty() {
         if !chatroom.chat_identifier.is_empty() {
-            return chatroom.chat_identifier.clone();
+            return one_line(&chatroom.chat_identifier);
         }
         return UNKNOWN.to_string();
     }
@@ -1102,7 +1132,43 @@ pub(crate) fn chat_display_label(config: &Config, chatroom: &Chat) -> String {
     if name == ORPHANED {
         return ORPHANED_THREAD_LABEL.to_string();
     }
-    name
+    one_line(&name)
+}
+
+/// The names of a chat's participants, each person once (several handles of
+/// one contact count as one person), joined with `, `, in the order
+/// upstream's `Config::filename` uses. A handle with no person shows as
+/// `Unknown`.
+fn participant_names(config: &Config, participants: &BTreeSet<i32>) -> String {
+    let people: BTreeSet<Participant> = participants
+        .iter()
+        .map(|handle_id| match config.real_participants.get(handle_id) {
+            Some(group) => Participant::Group(*group),
+            None => Participant::Handle(*handle_id),
+        })
+        .collect();
+    people
+        .iter()
+        .map(|person| match person {
+            Participant::Group(group) => config
+                .participants
+                .get(group)
+                .map_or(UNKNOWN, |name| name.details.as_str()),
+            Participant::Handle(_) => UNKNOWN,
+        })
+        .collect::<Vec<&str>>()
+        .join(PARTICIPANT_SEPARATOR)
+}
+
+/// `text` with each line break (`\r\n`, `\n` or `\r`) made a single space.
+fn one_line(text: &str) -> String {
+    if !text.contains(['\n', '\r']) {
+        return text.to_string();
+    }
+    text.split(['\n', '\r'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<&str>>()
+        .join(" ")
 }
 
 // MARK: Tests
@@ -1199,6 +1265,106 @@ mod tests {
         let chat = fake_chat();
         let label = chat_display_label(&app, &chat);
         assert_eq!(label, "Default");
+    }
+
+    // MARK: Thread headings (djf.12 F10)
+    /// A timeline config whose export path is `export_path`.
+    fn config_exporting_to(export_path: &str) -> Config {
+        let mut options = Options::fake_options(ExportType::Timeline);
+        options.export_path = std::path::PathBuf::from(export_path);
+        Config::fake_app(options)
+    }
+
+    /// An export path long enough that upstream's file names are shortened.
+    fn long_export_path() -> String {
+        format!("/tmp/{}", "x".repeat(200))
+    }
+
+    #[test]
+    fn heading_keeps_characters_a_file_name_cannot_hold() {
+        let config = config_exporting_to("/tmp");
+        let mut chat = fake_chat();
+        chat.display_name = Some("Plans: A/B".to_string());
+
+        // The file name replaces `:` and `/`; the heading keeps them.
+        assert_eq!(config.filename(&chat), "Plans_ A_B - 0.md");
+        assert_eq!(chat_display_label(&config, &chat), "Plans: A/B - 0");
+    }
+
+    #[test]
+    fn heading_from_a_display_name_does_not_depend_on_the_export_path() {
+        let name = "A group name long enough to be cut short in a file name".repeat(2);
+        let mut chat = fake_chat();
+        chat.display_name = Some(name.clone());
+        let short = config_exporting_to("/tmp");
+        let long = config_exporting_to(&long_export_path());
+
+        // The file name is shortened to fit the long path.
+        assert!(!long.filename(&chat).starts_with(&name));
+        for config in [&short, &long] {
+            assert_eq!(chat_display_label(config, &chat), format!("{name} - 0"));
+        }
+    }
+
+    #[test]
+    fn heading_from_participants_names_everyone_whatever_the_export_path() {
+        let names = [
+            "Participant with a fairly long name number one",
+            "Participant with a fairly long name number two",
+            "Participant with a fairly long name number three",
+        ];
+        let mut chat = fake_chat();
+        chat.rowid = 5;
+        let mut configs = [
+            config_exporting_to("/tmp"),
+            config_exporting_to(&long_export_path()),
+        ];
+        for config in &mut configs {
+            config
+                .chatroom_participants
+                .insert(5, BTreeSet::from([11, 12, 13, 14]));
+            for (handle, name) in (11..).zip(names) {
+                config.real_participants.insert(handle, handle);
+                config.participants.insert(handle, Name::fake_name(name));
+            }
+            // A second handle of the first person counts once.
+            config.real_participants.insert(14, 11);
+        }
+
+        // The file name drops names to fit the long path.
+        assert!(!configs[1].filename(&chat).contains(names[1]));
+        for config in &configs {
+            assert_eq!(chat_display_label(config, &chat), names.join(", "));
+        }
+    }
+
+    #[test]
+    fn heading_of_a_merged_conversation_uses_its_representative_row() {
+        let mut config = config_exporting_to("/tmp");
+        let mut named = fake_chat();
+        named.rowid = 7;
+        named.display_name = Some("Family".to_string());
+        config.chatrooms.insert(7, named);
+        config.chat_representatives.insert(6, 7);
+        config.real_chatrooms.insert(6, 6);
+        config.real_chatrooms.insert(7, 6);
+        let mut unnamed = fake_chat();
+        unnamed.rowid = 6;
+
+        assert_eq!(config.filename(&unnamed), "Family - 6.md");
+        assert_eq!(chat_display_label(&config, &unnamed), "Family - 6");
+    }
+
+    #[test]
+    fn heading_puts_a_name_on_one_line() {
+        let config = config_exporting_to("/tmp");
+        let mut chat = fake_chat();
+        chat.display_name = Some("Line one\r\nline two\nline three".to_string());
+
+        assert_eq!(
+            chat_display_label(&config, &chat),
+            "Line one line two line three - 0"
+        );
     }
 
     #[test]
@@ -1376,8 +1542,9 @@ mod tests {
 
     #[test]
     fn thread_label_is_computed_once_per_chat() {
-        // djf.5: chats with no name and no participants make upstream's
-        // `Config::filename` print a "has no members" warning per call.
+        // djf.5: chats with no name and no participants make
+        // `chat_display_label` print a "has no members" warning per call, as
+        // upstream's `Config::filename` does.
         let mut config =
             Config::fake_app(isolated_options("thread_label_is_computed_once_per_chat"));
         for (rowid, identifier) in [(1, "chat-one"), (2, "chat-two")] {
