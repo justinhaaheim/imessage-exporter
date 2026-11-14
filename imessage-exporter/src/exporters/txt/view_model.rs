@@ -1,7 +1,10 @@
 use askama::Template;
 
 use imessage_database::{
-    message_types::{expressives::Expressive, variants::Announcement},
+    message_types::{
+        expressives::Expressive,
+        variants::{Announcement, KeptMessage, UnknownEvent},
+    },
     tables::messages::models::GroupAction,
 };
 
@@ -42,12 +45,6 @@ pub(super) struct FindMyVM<'a> {
 }
 
 #[derive(Template)]
-#[template(path = "balloons/digital_touch.txt")]
-pub(super) struct DigitalTouchVM {
-    pub debug: String,
-}
-
-#[derive(Template)]
 #[template(path = "balloons/check_in.txt")]
 pub(super) struct CheckInVM<'a> {
     /// Resolved label: `balloon.caption.unwrap_or("Check In")`.
@@ -67,6 +64,50 @@ pub(super) struct PollOptionVM<'a> {
     pub text: &'a str,
     pub vote_count: usize,
     pub voters: Vec<&'a str>,
+}
+
+#[derive(Template)]
+#[template(path = "balloons/business_quick_reply.txt")]
+pub(super) struct QuickReplyVM<'a> {
+    pub summary: OptionalText<'a>,
+    pub options: Vec<QuickReplyOptionVM<'a>>,
+}
+
+pub(super) struct QuickReplyOptionVM<'a> {
+    pub text: &'a str,
+    pub selected: bool,
+}
+
+#[derive(Template)]
+#[template(path = "balloons/business_form_response.txt")]
+pub(super) struct FormResponseVM<'a> {
+    pub summary: OptionalText<'a>,
+    pub answers: Vec<FormAnswerVM<'a>>,
+}
+
+pub(super) struct FormAnswerVM<'a> {
+    pub question: &'a str,
+    pub answer: String,
+}
+
+#[derive(Template)]
+#[template(path = "balloons/business_form_request.txt")]
+pub(super) struct FormRequestVM<'a> {
+    pub title: OptionalText<'a>,
+    pub subtitle: OptionalText<'a>,
+}
+
+#[derive(Template)]
+#[template(path = "balloons/business_list_picker.txt")]
+pub(super) struct ListPickerVM<'a> {
+    pub summary: OptionalText<'a>,
+    pub items: Vec<ListPickerItemVM<'a>>,
+}
+
+pub(super) struct ListPickerItemVM<'a> {
+    pub title: &'a str,
+    pub subtitle: OptionalText<'a>,
+    pub selected: bool,
 }
 
 #[derive(Template)]
@@ -153,7 +194,8 @@ pub(super) struct StickerVM<'a> {
     /// `None` for the other variants.
     pub effect_prefix: Option<String>,
     pub who: &'a str,
-    /// Path returned by `format_attachment` (or its error string on failure).
+    /// Rendered path from `render_attachment`, or the display name on
+    /// preparation failure. Empty without filename metadata on the row.
     pub path: String,
     /// Pre-formatted parenthesized suffix like `" (App: Memoji)"`. `None` for
     /// `UserGenerated` (which uses `effect_prefix`) and on attachment errors.
@@ -192,7 +234,7 @@ pub(super) struct MessageVM<'a> {
     pub sender: &'a str,
     pub is_deleted: bool,
     pub subject: Option<&'a str>,
-    /// Static SharePlay marker (`"SharePlay Message\nEnded"`).
+    /// Static FaceTime or SharePlay marker.
     pub shareplay: Option<&'static str>,
     /// Static shared-location marker.
     pub shared_location: Option<&'static str>,

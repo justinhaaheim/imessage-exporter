@@ -1,7 +1,10 @@
 use askama::Template;
 
 use imessage_database::{
-    message_types::{expressives::Expressive, variants::Announcement},
+    message_types::{
+        expressives::Expressive,
+        variants::{Announcement, KeptMessage, UnknownEvent},
+    },
     tables::messages::models::{GroupAction, Service},
 };
 
@@ -12,12 +15,6 @@ use crate::exporters::{
         text::OptionalText,
     },
 };
-
-#[derive(Template)]
-#[template(path = "balloons/digital_touch.html")]
-pub(super) struct DigitalTouchVM {
-    pub debug: String,
-}
 
 #[derive(Template)]
 #[template(path = "balloons/find_my.html")]
@@ -129,25 +126,14 @@ impl AppStoreVM<'_> {
 /// The placemark's full address model.
 #[derive(Template)]
 #[template(path = "balloons/placemark.html")]
-#[allow(dead_code)]
 pub(super) struct PlacemarkVM<'a> {
     pub place_name: OptionalText<'a>,
     pub url: OptionalText<'a>,
     pub name: OptionalText<'a>,
     pub address: OptionalText<'a>,
-    // Retained for completeness but not rendered by the template
-    pub state: OptionalText<'a>,
-    // Retained for completeness but not rendered by the template
-    pub city: OptionalText<'a>,
-    // Retained for completeness but not rendered by the template
-    pub iso_country_code: OptionalText<'a>,
     pub postal_code: OptionalText<'a>,
     pub country: OptionalText<'a>,
-    // Retained for completeness but not rendered by the template
-    pub street: OptionalText<'a>,
     pub sub_administrative_area: OptionalText<'a>,
-    // Retained for completeness but not rendered by the template
-    pub sub_locality: OptionalText<'a>,
 }
 
 impl PlacemarkVM<'_> {
@@ -183,6 +169,50 @@ pub(super) struct PollOptionVM<'a> {
     /// attribute is rejected by the CSS linter.
     pub bar_html: Html,
     pub voters: Vec<&'a str>,
+}
+
+#[derive(Template)]
+#[template(path = "balloons/business_quick_reply.html")]
+pub(super) struct QuickReplyVM<'a> {
+    pub summary: OptionalText<'a>,
+    pub options: Vec<QuickReplyOptionVM<'a>>,
+}
+
+pub(super) struct QuickReplyOptionVM<'a> {
+    pub text: &'a str,
+    pub selected: bool,
+}
+
+#[derive(Template)]
+#[template(path = "balloons/business_form_response.html")]
+pub(super) struct FormResponseVM<'a> {
+    pub summary: OptionalText<'a>,
+    pub answers: Vec<FormAnswerVM<'a>>,
+}
+
+pub(super) struct FormAnswerVM<'a> {
+    pub question: &'a str,
+    pub answer: String,
+}
+
+#[derive(Template)]
+#[template(path = "balloons/business_form_request.html")]
+pub(super) struct FormRequestVM<'a> {
+    pub title: OptionalText<'a>,
+    pub subtitle: OptionalText<'a>,
+}
+
+#[derive(Template)]
+#[template(path = "balloons/business_list_picker.html")]
+pub(super) struct ListPickerVM<'a> {
+    pub summary: OptionalText<'a>,
+    pub items: Vec<ListPickerItemVM<'a>>,
+}
+
+pub(super) struct ListPickerItemVM<'a> {
+    pub title: &'a str,
+    pub subtitle: OptionalText<'a>,
+    pub selected: bool,
 }
 
 #[derive(Template)]
@@ -284,13 +314,14 @@ pub(super) struct MessageVM<'a> {
     /// True for `<div class="sent {service}">`, false for `<div class="received">`.
     pub is_from_me: bool,
     pub service: Service<'a>,
+    pub digital_touch: bool,
     pub date: String,
     pub read_after: String,
     pub reply_anchor: Option<ReplyAnchorKind>,
     pub sender: &'a str,
     pub is_deleted: bool,
     pub subject: Option<&'a str>,
-    /// SharePlay marker
+    /// FaceTime or SharePlay marker
     pub shareplay: Option<Html<&'static str>>,
     /// Shared-location marker
     pub shared_location: Option<Html<&'static str>>,

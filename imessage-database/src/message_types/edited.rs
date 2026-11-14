@@ -34,7 +34,7 @@ pub struct EditedEvent {
     /// Edit timestamp in Apple's nanosecond epoch.
     pub date: i64,
     /// The content of the edited message part, deserialized from the
-    /// [`typedstream`](crate::util::typedstream) format.
+    /// [`typedstream`](https://github.com/ReagentX/crabstep) format.
     pub text: String,
     /// Parsed body components for the edited text.
     pub components: Vec<BubbleComponent>,
@@ -65,6 +65,9 @@ pub struct EditedMessagePart {
     pub status: EditStatus,
     /// Historical edit entries for this part.
     pub edit_history: Vec<EditedEvent>,
+    /// `true` for a part whose index is listed under `rdfp`: an unsend
+    /// delivery failure.
+    pub unsend_failed: bool,
 }
 
 impl Default for EditedMessagePart {
@@ -72,6 +75,7 @@ impl Default for EditedMessagePart {
         Self {
             status: EditStatus::Original,
             edit_history: vec![],
+            unsend_failed: false,
         }
     }
 }
@@ -82,7 +86,7 @@ impl Default for EditedMessagePart {
 ///
 /// Edited or unsent messages are stored with a `NULL` `text` field.
 /// Edited messages include `message_summary_info` that contains a dictionary
-/// with message body part data, including [`typedstream`](crate::util::typedstream)-encoded
+/// with message body part data, including [`typedstream`](https://github.com/ReagentX/crabstep)-encoded
 /// edit history. The order of entries in the edit history represents the order
 /// the part changed: item `0` is the original text and the last item is the
 /// current text.
@@ -91,6 +95,9 @@ impl Default for EditedMessagePart {
 ///
 /// - `otr`: dictionary of message part indexes.
 /// - `rp`: list of unsent message part indexes.
+/// - `rdfp`: list of indexes for parts with failed unsend delivery.
+/// - `euh`: list of handle IDs for recipients using devices without edit
+///   and unsend support; one list per message for both edits and unsends.
 /// - `ec`: dictionary of edited message part indexes to edit history arrays.
 /// - Each `ec` item stores `d` (edit timestamp) and `t` (edited
 ///   `attributedBody` typedstream).
@@ -102,6 +109,11 @@ impl Default for EditedMessagePart {
 pub struct EditedMessage {
     /// One entry per message body part.
     pub parts: Vec<EditedMessagePart>,
+    /// Recipient handle IDs (phone numbers or email addresses in `handle.id`
+    /// form) from `euh`, in stored order. These recipients are recorded in
+    /// Messages as using devices without edit and unsend support.
+    /// Empty when the key is absent.
+    pub unsupported_handles: Vec<String>,
 }
 
 impl<'a> BalloonProvider<'a> for EditedMessage {
@@ -130,12 +142,18 @@ impl<'a> BalloonProvider<'a> for EditedMessage {
                     )
                 })?;
 
-                for event in events {
+                for (event_idx, event) in events.iter().enumerate() {
                     let message_data = event.as_dictionary().ok_or_else(|| {
-                        PlistParseError::InvalidTypeIndex(idx, "dictionary".to_string())
+                        PlistParseError::InvalidTypeIndex(event_idx, "dictionary".to_string())
                     })?;
 
-                    let timestamp = extract_int_key(message_data, "d")? * TIMESTAMP_FACTOR;
+                    let timestamp = extract_int_key(message_data, "d")?
+                        .checked_mul(TIMESTAMP_FACTOR)
+                        .ok_or_else(|| {
+                            PlistParseError::InvalidEditedMessage(
+                                "edit timestamp out of range".to_string(),
+                            )
+                        })?;
 
                     let data = extract_bytes_key(message_data, "t")?;
 
@@ -183,6 +201,27 @@ impl<'a> BalloonProvider<'a> for EditedMessage {
             }
         }
 
+        // Skip malformed elements in the `rdfp` and `euh` delivery metadata
+        // to preserve the edit history already parsed above.
+        if let Ok(failed_message_indexes) = extract_array_key(plist_root, "rdfp") {
+            for failed_message_idx in failed_message_indexes
+                .iter()
+                .filter_map(Value::as_signed_integer)
+            {
+                if let Some(item) = edited.parts.get_mut(failed_message_idx as usize) {
+                    item.unsend_failed = true;
+                }
+            }
+        }
+
+        if let Ok(handles) = extract_array_key(plist_root, "euh") {
+            edited.unsupported_handles = handles
+                .iter()
+                .filter_map(Value::as_string)
+                .map(Into::into)
+                .collect();
+        }
+
         Ok(edited)
     }
 }
@@ -192,6 +231,7 @@ impl EditedMessage {
     fn with_capacity(capacity: usize) -> Self {
         EditedMessage {
             parts: Vec::with_capacity(capacity),
+            unsupported_handles: vec![],
         }
     }
 
@@ -224,7 +264,7 @@ mod test_parser {
     use crate::message_types::{edited::EditedMessage, variants::BalloonProvider};
     use crate::tables::messages::models::{AttributedRange, BubbleComponent};
 
-    use plist::Value;
+    use plist::{Dictionary, Value};
     use std::env::current_dir;
     use std::fs::File;
 
@@ -283,7 +323,9 @@ mod test_parser {
                         None,
                     ),
                 ],
+                unsend_failed: false,
             }],
+            unsupported_handles: vec![],
         };
 
         assert_eq!(parsed, expected);
@@ -307,6 +349,7 @@ mod test_parser {
                 EditedMessagePart {
                     status: EditStatus::Original,
                     edit_history: vec![], // The first part of this is the URL preview
+                    unsend_failed: false,
                 },
                 EditedMessagePart {
                     status: EditStatus::Edited,
@@ -332,8 +375,10 @@ mod test_parser {
                             Some("292BF9C6-C9B8-4827-BE65-6EA1C9B5B384".to_string()),
                         ),
                     ],
+                    unsend_failed: false,
                 },
             ],
+            unsupported_handles: vec!["+0000000000".to_string()],
         };
 
         assert_eq!(parsed, expected);
@@ -385,7 +430,9 @@ mod test_parser {
                         Some("0D93DF88-05BA-4418-9B20-79918ADD9923".to_string()),
                     ),
                 ],
+                unsend_failed: false,
             }],
+            unsupported_handles: vec!["+0000000000".to_string()],
         };
 
         assert_eq!(parsed, expected);
@@ -405,7 +452,9 @@ mod test_parser {
             parts: vec![EditedMessagePart {
                 status: EditStatus::Unsent,
                 edit_history: vec![],
+                unsend_failed: false,
             }],
+            unsupported_handles: vec![],
         };
 
         assert_eq!(parsed, expected);
@@ -426,20 +475,25 @@ mod test_parser {
                 EditedMessagePart {
                     status: EditStatus::Original,
                     edit_history: vec![],
+                    unsend_failed: false,
                 },
                 EditedMessagePart {
                     status: EditStatus::Original,
                     edit_history: vec![],
+                    unsend_failed: false,
                 },
                 EditedMessagePart {
                     status: EditStatus::Original,
                     edit_history: vec![],
+                    unsend_failed: false,
                 },
                 EditedMessagePart {
                     status: EditStatus::Unsent,
                     edit_history: vec![],
+                    unsend_failed: false,
                 },
             ],
+            unsupported_handles: vec!["+15558675309".to_string()],
         };
 
         assert_eq!(parsed, expected);
@@ -460,10 +514,12 @@ mod test_parser {
                 EditedMessagePart {
                     status: EditStatus::Original,
                     edit_history: vec![],
+                    unsend_failed: false,
                 },
                 EditedMessagePart {
                     status: EditStatus::Original,
                     edit_history: vec![],
+                    unsend_failed: false,
                 },
                 EditedMessagePart {
                     status: EditStatus::Edited,
@@ -489,8 +545,10 @@ mod test_parser {
                             None,
                         ),
                     ],
+                    unsend_failed: false,
                 },
             ],
+            unsupported_handles: vec![],
         };
 
         assert_eq!(parsed, expected);
@@ -511,10 +569,12 @@ mod test_parser {
                 EditedMessagePart {
                     status: EditStatus::Original,
                     edit_history: vec![],
+                    unsend_failed: false,
                 },
                 EditedMessagePart {
                     status: EditStatus::Original,
                     edit_history: vec![],
+                    unsend_failed: false,
                 },
                 EditedMessagePart {
                     status: EditStatus::Edited,
@@ -540,12 +600,15 @@ mod test_parser {
                             None,
                         ),
                     ],
+                    unsend_failed: false,
                 },
                 EditedMessagePart {
                     status: EditStatus::Unsent,
                     edit_history: vec![],
+                    unsend_failed: false,
                 },
             ],
+            unsupported_handles: vec![],
         };
 
         assert_eq!(parsed, expected);
@@ -586,7 +649,9 @@ mod test_parser {
                         Some("76A466B8-D21E-4A20-AF62-FF2D3A20D31C".to_string()),
                     ),
                 ],
+                unsend_failed: false,
             }],
+            unsupported_handles: vec!["+5558675308".to_string()],
         };
 
         assert_eq!(parsed, expected);
@@ -594,17 +659,6 @@ mod test_parser {
         let expected_item = Some(expected.parts.first().unwrap());
         assert_eq!(parsed.part(0), expected_item);
     }
-}
-
-#[cfg(test)]
-mod test_gen {
-    use plist::Value;
-    use std::env::current_dir;
-    use std::fs::File;
-
-    use crate::message_types::text_effects::{style::Style, text_effect::TextEffect};
-    use crate::message_types::{edited::EditedMessage, variants::BalloonProvider};
-    use crate::tables::messages::models::{AttributedRange, BubbleComponent};
 
     #[test]
     fn test_parse_edited_memoji() {
@@ -641,242 +695,120 @@ mod test_gen {
         );
     }
 
-    #[test]
-    fn test_parse_edited() {
-        let plist_path = current_dir()
-            .unwrap()
-            .as_path()
-            .join("test_data/edited_message/Edited.plist");
-        let plist_data = File::open(plist_path).unwrap();
-        let plist = Value::from_reader(plist_data).unwrap();
-        let parsed = EditedMessage::from_map(&plist).unwrap();
-
-        let expected_attrs = [
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                15,
-                vec![TextEffect::Default],
-            )])],
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                6,
-                vec![TextEffect::Default],
-            )])],
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                6,
-                vec![TextEffect::Default],
-            )])],
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                14,
-                vec![TextEffect::Default],
-            )])],
-        ];
-
-        for event in parsed.parts {
-            for (idx, part) in event.edit_history.iter().enumerate() {
-                assert_eq!(part.components, expected_attrs[idx]);
-            }
+    /// Build a `message_summary_info` payload with `parts` unchanged parts
+    /// under `otr` and the additional `extra` keys.
+    fn summary(parts: usize, extra: Vec<(&str, Value)>) -> Value {
+        let mut otr = Dictionary::new();
+        for idx in 0..parts {
+            let mut range = Dictionary::new();
+            range.insert("lo".to_string(), Value::Integer(0.into()));
+            range.insert("le".to_string(), Value::Integer(1.into()));
+            otr.insert(idx.to_string(), Value::Dictionary(range));
         }
+        let mut root = Dictionary::new();
+        root.insert("otr".to_string(), Value::Dictionary(otr));
+        for (key, value) in extra {
+            root.insert(key.to_string(), value);
+        }
+        Value::Dictionary(root)
+    }
+
+    fn strings(items: &[&str]) -> Value {
+        Value::Array(
+            items
+                .iter()
+                .map(|s| Value::String((*s).to_string()))
+                .collect(),
+        )
+    }
+
+    fn ints(items: &[i64]) -> Value {
+        Value::Array(items.iter().map(|i| Value::Integer((*i).into())).collect())
     }
 
     #[test]
-    fn test_parse_edited_to_link() {
-        let plist_path = current_dir()
-            .unwrap()
-            .as_path()
-            .join("test_data/edited_message/EditedToLink.plist");
-        let plist_data = File::open(plist_path).unwrap();
-        let plist = Value::from_reader(plist_data).unwrap();
+    fn test_parse_unsupported_handles_in_stored_order() {
+        let handles = ["+15558675309", "person@example.com", "+15555550100"];
+        let plist = summary(1, vec![("euh", strings(&handles))]);
         let parsed = EditedMessage::from_map(&plist).unwrap();
 
-        let expected_attrs = [
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                11,
-                vec![TextEffect::Default],
-            )])],
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                55,
-                vec![TextEffect::Default],
-            )])],
-        ];
-
-        for event in parsed.parts {
-            for (idx, part) in event.edit_history.iter().enumerate() {
-                assert_eq!(part.components, expected_attrs[idx]);
-            }
-        }
+        assert_eq!(parsed.unsupported_handles, handles);
     }
 
     #[test]
-    fn test_parse_edited_to_link_and_back() {
-        let plist_path = current_dir()
-            .unwrap()
-            .as_path()
-            .join("test_data/edited_message/EditedToLinkAndBack.plist");
-        let plist_data = File::open(plist_path).unwrap();
-        let plist = Value::from_reader(plist_data).unwrap();
-        let parsed = EditedMessage::from_map(&plist).unwrap();
+    fn test_parse_absent_unsupported_handles() {
+        let parsed = EditedMessage::from_map(&summary(1, vec![])).unwrap();
 
-        let expected_attrs = [
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                24,
-                vec![TextEffect::Default],
-            )])],
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                69,
-                vec![TextEffect::Default],
-            )])],
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                39,
-                vec![TextEffect::Default],
-            )])],
-        ];
-
-        for event in parsed.parts {
-            for (idx, part) in event.edit_history.iter().enumerate() {
-                assert_eq!(part.components, expected_attrs[idx]);
-            }
-        }
+        assert!(parsed.unsupported_handles.is_empty());
     }
 
     #[test]
-    fn test_parse_deleted() {
-        let plist_path = current_dir()
-            .unwrap()
-            .as_path()
-            .join("test_data/edited_message/Deleted.plist");
-        let plist_data = File::open(plist_path).unwrap();
-        let plist = Value::from_reader(plist_data).unwrap();
+    fn test_parse_unsupported_handles_skips_non_string() {
+        let plist = summary(
+            1,
+            vec![
+                ("rp", ints(&[0])),
+                (
+                    "euh",
+                    Value::Array(vec![
+                        Value::Integer(1.into()),
+                        Value::String("+15558675309".to_string()),
+                    ]),
+                ),
+            ],
+        );
         let parsed = EditedMessage::from_map(&plist).unwrap();
 
-        let expected_attrs: [Vec<BubbleComponent>; 0] = [];
-
-        for event in parsed.parts {
-            for (idx, part) in event.edit_history.iter().enumerate() {
-                assert_eq!(part.components, expected_attrs[idx]);
-            }
-        }
+        assert_eq!(parsed.unsupported_handles, ["+15558675309"]);
+        assert_eq!(parsed.parts[0].status, EditStatus::Unsent);
     }
 
     #[test]
-    fn test_parse_multipart_deleted() {
-        let plist_path = current_dir()
-            .unwrap()
-            .as_path()
-            .join("test_data/edited_message/MultiPartOneDeleted.plist");
-        let plist_data = File::open(plist_path).unwrap();
-        let plist = Value::from_reader(plist_data).unwrap();
+    fn test_parse_unsend_failed_marks_listed_parts() {
+        let plist = summary(3, vec![("rp", ints(&[0, 2])), ("rdfp", ints(&[2]))]);
         let parsed = EditedMessage::from_map(&plist).unwrap();
 
-        let expected_attrs: [Vec<BubbleComponent>; 0] = [];
-
-        for event in parsed.parts {
-            for (idx, part) in event.edit_history.iter().enumerate() {
-                assert_eq!(part.components, expected_attrs[idx]);
-            }
-        }
+        let failed: Vec<bool> = parsed.parts.iter().map(|part| part.unsend_failed).collect();
+        assert_eq!(failed, [false, false, true]);
+        assert_eq!(parsed.parts[0].status, EditStatus::Unsent);
+        assert_eq!(parsed.parts[2].status, EditStatus::Unsent);
     }
 
     #[test]
-    fn test_parse_multipart_edited_and_deleted() {
-        let plist_path = current_dir()
-            .unwrap()
-            .as_path()
-            .join("test_data/edited_message/EditedAndDeleted.plist");
-        let plist_data = File::open(plist_path).unwrap();
-        let plist = Value::from_reader(plist_data).unwrap();
+    fn test_parse_unsend_failed_ignores_out_of_range_index() {
+        let plist = summary(2, vec![("rdfp", ints(&[5, -1]))]);
         let parsed = EditedMessage::from_map(&plist).unwrap();
 
-        let expected_attrs = [
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                14,
-                vec![TextEffect::Default],
-            )])],
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                26,
-                vec![TextEffect::Default],
-            )])],
-        ];
-
-        for event in parsed.parts {
-            for (idx, part) in event.edit_history.iter().enumerate() {
-                assert_eq!(part.components, expected_attrs[idx]);
-            }
-        }
+        assert!(parsed.parts.iter().all(|part| !part.unsend_failed));
+        assert_eq!(parsed.items(), 2);
     }
 
     #[test]
-    fn test_parse_multipart_edited_and_unsent() {
-        let plist_path = current_dir()
-            .unwrap()
-            .as_path()
-            .join("test_data/edited_message/EditedAndUnsent.plist");
-        let plist_data = File::open(plist_path).unwrap();
-        let plist = Value::from_reader(plist_data).unwrap();
+    fn test_parse_unsend_failed_skips_non_integer() {
+        let plist = summary(
+            2,
+            vec![
+                ("rp", ints(&[0, 1])),
+                (
+                    "rdfp",
+                    Value::Array(vec![
+                        Value::String("0".to_string()),
+                        Value::Integer(1.into()),
+                    ]),
+                ),
+            ],
+        );
         let parsed = EditedMessage::from_map(&plist).unwrap();
 
-        for parts in &parsed.parts {
-            for part in &parts.edit_history {
-                println!("{:#?}", part.components);
-            }
-        }
-
-        let expected_attrs: [Vec<BubbleComponent>; 2] = [
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                11,
-                vec![TextEffect::Default],
-            )])],
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                23,
-                vec![TextEffect::Default],
-            )])],
-        ];
-
-        for event in parsed.parts {
-            for (idx, part) in event.edit_history.iter().enumerate() {
-                assert_eq!(part.components, expected_attrs[idx]);
-            }
-        }
+        let failed: Vec<bool> = parsed.parts.iter().map(|part| part.unsend_failed).collect();
+        assert_eq!(failed, [false, true]);
+        assert_eq!(parsed.parts[0].status, EditStatus::Unsent);
     }
 
     #[test]
-    fn test_parse_edited_with_formatting() {
-        let plist_path = current_dir()
-            .unwrap()
-            .as_path()
-            .join("test_data/edited_message/EditedWithFormatting.plist");
-        let plist_data = File::open(plist_path).unwrap();
-        let plist = Value::from_reader(plist_data).unwrap();
-        let parsed = EditedMessage::from_map(&plist).unwrap();
+    fn test_parse_absent_unsend_failed() {
+        let parsed = EditedMessage::from_map(&summary(2, vec![])).unwrap();
 
-        let expected_attrs: [Vec<BubbleComponent>; 2] = [
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                4,
-                vec![TextEffect::Default],
-            )])],
-            vec![BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                4,
-                vec![TextEffect::Styles(vec![Style::Strikethrough])],
-            )])],
-        ];
-
-        for event in parsed.parts {
-            for (idx, part) in event.edit_history.iter().enumerate() {
-                assert_eq!(part.components, expected_attrs[idx]);
-            }
-        }
+        assert!(parsed.parts.iter().all(|part| !part.unsend_failed));
     }
 }

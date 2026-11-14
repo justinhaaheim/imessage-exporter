@@ -11,7 +11,7 @@ This tool targets the current latest public release for Messages.app. It may wor
 - Local macOS messages
 - Encrypted or unencrypted local iOS backups
   - Unencrypted backups are resolved normally
-  - Encrypted backups are resolved with [crabapple](https://github.com/ReagentX/crabapple)
+  - Encrypted backups are resolved with [`crabapple`](https://github.com/ReagentX/crabapple)
 - Jailbroken iOS filesystem data
   - Uses `sms.db`, which follows the same schema as macOS `chat.db`
   - Resolved as a macOS database with an alternate attachment root
@@ -112,10 +112,15 @@ This tool targets the current latest public release for Messages.app. It may wor
   - Supports system message types as well as third party [applications](https://support.apple.com/en-us/104969)
     - Apple Fitness messages
     - Photo Slideshow messages
-    - SharePlay/Facetime messages
+    - FaceTime and SharePlay messages
+      - FaceTime or SharePlay labels based on the call's audio and video mode, matching the labels in Messages
     - Check In messages
     - Find My messages
     - Polls and Votes
+    - Business Chat messages
+      - Quick Replies
+      - Interactive Forms
+      - List Pickers
 - Handwritten Messages
   - Parses the protobuf payload to extract [handwritten](https://support.apple.com/en-my/guide/iphone/iph3d4cb79c9/ios) message data
     - Displayed as embedded `svg` in HTML exports
@@ -124,16 +129,36 @@ This tool targets the current latest public release for Messages.app. It may wor
       - `clone, basic, full`: saved as an `svg` file
 - Digital Touch
   - Parses the protobuf payload to extract [Digital Touch](https://support.apple.com/guide/ipod-touch/send-a-digital-touch-effect-iph3fadba219/ios) message data
-    - Displayed as text that describes the type of message sent in HTML and TXT exports
+    - Supports all Digital Touch effects:
+      - Taps
+      - Sketches
+      - Kisses
+      - Heartbeats, including heartbreaks
+      - Fireballs
+      - Photos and videos
+    - HTML exports render a static frame depicting the captured data as an embedded `svg` on a black `4:5` canvas
+      - A photo is shown as the canvas backdrop, with any sketch drawn over it
+      - A video is shown as an embedded video player
+    - TXT exports describe each effect on a single line, including stroke and point counts or beats per minute
 - Duplicated group chats
   - Handles (participants) and chats (threads) can become duplicated
   - On startup:
-    - Different handles that belong to the same person are combined
-    - Chatrooms that contain identical contacts (i.e., duplicated handles) are combined
-    - Divergent chatrooms that map to the same conversation in the `chat_lookup` table are combined
+    - We group handles that belong to the same person: the same address on several services, addresses that share a `person_centric_id`, and addresses that appear on one Contacts card
+    - We combine chatrooms whose participants are the same people, comparing handle groups instead of handle rows
+    - We combine split chatrooms with the same conversation mapping in `chat_lookup`
+  - See [the duplicate problem](tables/duplicates.md) for the mechanism
 - Announcements
   - Handles all types of chatroom announcements
-    - Group photo changes
+    - Group photo changes, including changes recorded in Messages but hidden from the conversation
+      - Business named as the actor for brand logo updates
+    - Group name changes, including removing the name
     - Chat participant modifications
+      - Database owner named as the actor for leaving an Apple Messages for Business conversation
     - Phone number changes
-    - Chat background settings
+    - Kept audio, video, and app messages
+    - Emergency SOS transcript sharing stops
+    - Locations sent to emergency services
+    - Chat background settings, including backgrounds marked as possibly sensitive in Messages and changes recorded but hidden from the conversation
+    - No actor attribution for group changes recorded without an actor in Messages
+    - Failed group changes marked after the timestamp
+    - Unknown group, location sharing, and other events, with raw codes for rows displayed without text in Messages

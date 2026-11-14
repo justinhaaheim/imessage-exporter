@@ -6,6 +6,8 @@ use rusqlite::Connection;
 
 use crate::error::table::TableError;
 
+use std::collections::HashSet;
+
 pub(crate) fn count_query(db: &Connection, sql: &str) -> Result<usize, TableError> {
     let count = db.prepare(sql)?.query_row([], |row| row.get::<_, i64>(0))?;
 
@@ -50,6 +52,27 @@ pub(crate) fn column_exists(
     Ok(false)
 }
 
+/// Collect the declared column names of `table_name`, lowercased for
+/// case-insensitive membership checks.
+///
+/// A missing table yields an empty set rather than an error, so callers can
+/// treat "table absent" and "no recognized columns" uniformly.
+pub(crate) fn column_names(
+    db: &Connection,
+    table_name: &str,
+) -> Result<HashSet<String>, TableError> {
+    let mut statement = db.prepare(&format!(
+        "PRAGMA table_info({})",
+        quote_sqlite_identifier(table_name)
+    ))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut names = HashSet::new();
+    for name in columns {
+        names.insert(name?.to_ascii_lowercase());
+    }
+    Ok(names)
+}
+
 fn quote_sqlite_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -60,9 +83,11 @@ pub struct HandleDiagnostic {
     /// Total handles in the table.
     pub total_handles: usize,
     /// Distinct `person_centric_id` values, or `None` when the column is unavailable.
-    pub handles_with_multiple_ids: Option<usize>,
-    /// Handles deduplicated into canonical handles.
-    pub total_duplicated: usize,
+    pub person_centric_ids: Option<usize>,
+    /// Number of groups with more than one handle row.
+    pub multi_handle_groups: usize,
+    /// Number of handle rows beyond the first row in each group.
+    pub merged_handles: usize,
 }
 
 /// Diagnostic data for the `message` table.

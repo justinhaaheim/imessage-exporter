@@ -4,8 +4,9 @@ use imessage_database::{
     message_types::{
         app::AppMessage,
         app_store::AppStoreMessage,
+        business_chat::BusinessMessage,
         collaboration::CollaborationMessage,
-        digital_touch::DigitalTouch,
+        digital_touch::DigitalTouchMessage,
         edited::EditedMessage,
         handwriting::HandwrittenMessage,
         music::MusicMessage,
@@ -33,7 +34,9 @@ use imessage_database::{
 
 use crate::{
     app::{error::RuntimeError, runtime::Config},
-    exporters::shared::{balloon::rewrite_fitness_receiver, part::AttachmentResolver},
+    exporters::shared::{
+        attachment::AttachmentFailure, balloon::rewrite_fitness_receiver, part::AttachmentResolver,
+    },
 };
 
 /// Where a message sits in the rendered conversation hierarchy. Each exporter
@@ -65,6 +68,15 @@ pub(crate) enum AttachmentRender {
     NamedFile(String),
 }
 
+impl From<AttachmentFailure> for AttachmentRender {
+    fn from(failure: AttachmentFailure) -> Self {
+        match failure {
+            AttachmentFailure::MissingFilename => AttachmentRender::MissingFilename,
+            AttachmentFailure::NamedFile(name) => AttachmentRender::NamedFile(name),
+        }
+    }
+}
+
 // MARK: Message
 /// Formatting hooks used by each exporter to render a message.
 pub(crate) trait MessageFormatter<'a> {
@@ -72,17 +84,17 @@ pub(crate) trait MessageFormatter<'a> {
     /// [`AttachmentRender`] tells the caller which body hook to invoke.
     fn format_attachment(
         &self,
-        attachment: &'a mut Attachment,
+        attachment: &'a Attachment,
         msg: &'a Message,
         metadata: &AttachmentMeta,
     ) -> AttachmentRender;
     /// Format a sticker, possibly by reading the disk.
-    fn format_sticker(&self, attachment: &'a mut Attachment, msg: &'a Message) -> String;
+    fn format_sticker(&self, attachment: &'a Attachment, msg: &'a Message) -> String;
     /// Format an app message from its payload and attachments.
     fn format_app(
         &self,
         msg: &'a Message,
-        attachments: &mut Vec<Attachment>,
+        attachments: &[Attachment],
     ) -> Result<String, RuntimeError>;
     /// Format a tapback displayed under a message.
     fn format_tapback(&self, msg: &Message) -> Result<String, RuntimeError>;
@@ -90,8 +102,12 @@ pub(crate) trait MessageFormatter<'a> {
     /// the same buffer that [`format_message_into`](Self::format_message_into)
     /// uses, so the per-message hot path doesn't allocate per call.
     fn format_announcement(&self, msg: &Message, out: &mut String);
-    /// Format a `SharePlay` message.
-    fn format_shareplay(&self) -> &'static str;
+    /// Format a FaceTime or SharePlay row ([`Message::is_shareplay`]). Use
+    /// SharePlay only when [`conversation_av_mode`](Message::conversation_av_mode) is
+    /// [`AVLess`](imessage_database::tables::messages::models::ConversationAVMode::AVLess),
+    /// and FaceTime otherwise, including when the mode is absent, to match
+    /// the labels in Messages.
+    fn format_shareplay(&self, msg: &Message) -> &'static str;
     /// Format a legacy shared-location message.
     fn format_shared_location(&self, kind: SharedLocation) -> &'static str;
     /// Format an edited message by applying the edit's
@@ -103,7 +119,7 @@ pub(crate) trait MessageFormatter<'a> {
         msg: &'a Message,
         edited_message: &'a EditedMessage,
         message_part_idx: usize,
-        attachments: &'a mut Vec<Attachment>,
+        attachments: &'a [Attachment],
         resolver: &mut AttachmentResolver,
     ) -> Option<String>;
     /// Format the text of a set of [`AttributedRange`]s applied to `text`.
@@ -119,7 +135,7 @@ pub(crate) trait MessageFormatter<'a> {
         &'a self,
         message: &'a Message,
         ranges: &'a [AttributedRange],
-        attachments: &'a mut Vec<Attachment>,
+        attachments: &'a [Attachment],
         resolver: &mut AttachmentResolver,
     ) -> <Self as PartBodyBuilder>::Body
     where
@@ -151,7 +167,7 @@ pub(crate) trait BalloonFormatter {
     /// Format a handwritten note message.
     fn format_handwriting(&self, msg: &Message, balloon: &HandwrittenMessage) -> String;
     /// Format a digital touch message.
-    fn format_digital_touch(&self, msg: &Message, balloon: &DigitalTouch) -> String;
+    fn format_digital_touch(&self, msg: &Message, balloon: &DigitalTouchMessage) -> String;
     /// Format an Apple Pay message.
     fn format_apple_pay(&self, balloon: &AppMessage) -> String;
     /// Format a Fitness message.
@@ -164,12 +180,14 @@ pub(crate) trait BalloonFormatter {
     fn format_check_in(&self, balloon: &AppMessage) -> String;
     /// Format a poll message.
     fn format_poll(&self, poll: &Poll) -> String;
+    /// Format an Apple Business Chat message.
+    fn format_business(&self, balloon: &BusinessMessage) -> String;
     /// Format an app message without a specialized renderer.
     fn format_generic_app(
         &self,
         balloon: &AppMessage,
         bundle_id: &str,
-        attachments: &mut Vec<Attachment>,
+        attachments: &[Attachment],
         msg: &Message,
     ) -> String;
 }

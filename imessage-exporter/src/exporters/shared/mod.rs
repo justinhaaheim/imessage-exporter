@@ -1,6 +1,7 @@
 pub(crate) mod announcement;
 pub(crate) mod attachment;
 pub(crate) mod balloon;
+pub(crate) mod date_span;
 pub(crate) mod driver;
 pub(crate) mod edited;
 pub(crate) mod message;
@@ -8,5 +9,7 @@ pub(crate) mod part;
 pub(crate) mod render;
 pub(crate) mod reply;
 pub(crate) mod tapback;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod text;
 pub(crate) mod time;

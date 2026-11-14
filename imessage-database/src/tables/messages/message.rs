@@ -1,41 +1,78 @@
 /*!
  Message table rows, query helpers, and body parsing.
 
- # Iterating over Message Data
+ # Iterating Over Message Data
 
- Use [`Message::stream()`] to iterate over the default message query.
+ Compose the message query from probed [`Capabilities`]. For [`Message`],
+ use [`Message::stream_rows()`] to prepare the query and [`Message::rows()`]
+ to iterate over it; there is no [`Table`](crate::tables::table::Table)
+ implementation for this type.
 
  ## Example
  ```no_run
  use imessage_database::{
-     error::table::TableError,
      tables::{
+         capabilities::Capabilities,
          messages::Message,
-         table::{get_connection, Table},
+         table::get_connection,
      },
-     util::dirs::default_db_path,
+     util::{dirs::default_db_path, query_context::QueryContext},
  };
 
- #[derive(Debug)]
- struct ProgramError(TableError);
-
- impl From<TableError> for ProgramError {
-     fn from(err: TableError) -> Self {
-         Self(err)
-     }
- }
-
  // Get the default database path and connect to it
- let db_path = default_db_path();
+ let db_path = default_db_path().unwrap();
  let conn = get_connection(&db_path).unwrap();
 
- Message::stream(&conn, |message_result| {
-    match message_result {
-        Ok(message) => println!("Message: {:#?}", message),
-        Err(e) => eprintln!("Error: {:?}", e),
-    }
-    Ok::<(), ProgramError>(())
- }).unwrap();
+ // Probe the schema once and use the result to compose every message query
+ let capabilities = Capabilities::determine(&conn).unwrap();
+ let query_context = QueryContext::default();
+
+ let mut statement = Message::stream_rows(&conn, &capabilities, &query_context).unwrap();
+ for message_result in Message::rows(&mut statement, []).unwrap() {
+     match message_result {
+         Ok(message) => println!("Message: {:#?}", message),
+         Err(e) => eprintln!("Error: {:?}", e),
+     }
+ }
+ ```
+
+ # Iterating Over Filtered Message Data
+
+ Use a [`QueryContext`] to specify filters and constraints for the message query.
+
+ ## Example
+ ```no_run
+ use chrono::Utc;
+ use imessage_database::{
+     tables::{
+         capabilities::Capabilities,
+         messages::Message,
+         table::get_connection,
+     },
+     util::{dirs::default_db_path, query_context::QueryContext},
+ };
+
+ // Get the default database path and connect to it
+ let db_path = default_db_path().unwrap();
+ let conn = get_connection(&db_path).unwrap();
+ let capabilities = Capabilities::determine(&conn).unwrap();
+ let mut query_context = QueryContext::default();
+
+ // Customize the query context as needed
+ // For example, filter messages by date using midnight in `Utc`:
+ query_context.set_start("2023-01-01", &Utc).unwrap();
+ query_context.set_end("2023-12-31", &Utc).unwrap();
+
+ // Prepare the statement for streaming rows
+ let mut statement = Message::stream_rows(&conn, &capabilities, &query_context).unwrap();
+
+ // Iterate over the streamed rows and handle each message result
+ for message_result in Message::rows(&mut statement, []).unwrap() {
+     match message_result {
+         Ok(message) => println!("Message: {:#?}", message),
+         Err(e) => eprintln!("Error: {:?}", e),
+     }
+ }
  ```
 
  # Making Custom Message Queries
@@ -47,6 +84,26 @@
  - [`Message::num_attachments`]
  - [`Message::deleted_from`]
  - [`Message::num_replies`]
+
+ [`Message::rows`] and [`Message::row`] resolve result columns by name once,
+ then decode by ordinal. Column order is immaterial; column names are not. Six
+ columns are mandatory: `rowid`, `guid`, `date`, `is_from_me`,
+ `num_attachments`, and `num_replies`. A query that omits any of them fails to
+ deserialize. Every other column [`Message`] reads may be omitted and takes its
+ default. Thus,
+ [`Message::filter_action`] and [`Message::filter_sub_action`] read as `None`
+ against schemas without those columns.
+
+ Body parsing uses optional `attributedBody`, `message_summary_info`, and
+ `has_payload_data` result columns. The payload flag is `payload_data IS NOT
+ NULL`; custom `m.*` projections can supply raw `payload_data` instead. Missing
+ parser inputs are treated as absent, so a projection containing only `text`
+ still produces plain-text body components. Text recovery failures preserve
+ the row's metadata and any recovered body components or edit metadata.
+
+ Built-in queries preserve the storage bytes of text-valued parser inputs in
+ UTF-16 databases. Custom queries must cast such inputs to `BLOB` to prevent
+ SQLite from transcoding them to UTF-8 before parsing.
 
  ## Sample Queries
 
@@ -91,14 +148,11 @@
 
  ```no_run
  use imessage_database::{
-     tables::{
-         messages::Message,
-         table::{get_connection, Table},
-     },
+     tables::{messages::Message, table::get_connection},
      util::dirs::default_db_path
  };
 
- let db_path = default_db_path();
+ let db_path = default_db_path().unwrap();
  let db = get_connection(&db_path).unwrap();
 
  let mut statement = db.prepare_cached("
@@ -129,10 +183,10 @@ use std::{
     io::{Cursor, Read},
 };
 
-use chrono::{DateTime, offset::Local};
+use chrono::{DateTime, TimeZone, Utc};
 use crabstep::TypedStreamDeserializer;
 use plist::Value;
-use rusqlite::{CachedStatement, Connection, Result, Row};
+use rusqlite::{CachedStatement, Connection, Params, Result, Statement};
 
 use crate::{
     error::{message::MessageError, table::TableError},
@@ -142,41 +196,44 @@ use crate::{
         polls::Poll,
         text_effects::text_effect::TextEffect,
         translation::Translation,
-        variants::{Announcement, BalloonProvider, CustomBalloon, Tapback, TapbackAction, Variant},
+        variants::{
+            Announcement, BalloonProvider, CustomBalloon, KeptMessage, Tapback, TapbackAction,
+            UnknownEvent, Variant,
+        },
     },
     tables::{
+        capabilities::Capabilities,
         diagnostic::{MessageDiagnostic, count_query, table_exists},
         messages::{
             body::{parse_body_legacy, parse_body_typedstream},
-            models::{BubbleComponent, GroupAction, Service, SharedLocation},
-            query_parts::{ios_13_older_query, ios_14_15_query, ios_16_newer_query},
+            columns::MessageColumns,
+            models::{
+                BubbleComponent, ConversationAVMode, FilterAction, GroupAction, Service,
+                SharedLocation,
+            },
+            query_parts::{from_clause, message_query, prepare_message_query},
         },
         table::{
-            ATTRIBUTED_BODY, CHAT_MESSAGE_JOIN, Cacheable, MESSAGE, MESSAGE_ATTACHMENT_JOIN,
-            MESSAGE_PAYLOAD, MESSAGE_SUMMARY_INFO, RECENTLY_DELETED, Table,
+            CHAT_MESSAGE_JOIN, MESSAGE, MESSAGE_PAYLOAD, MESSAGE_SUMMARY_INFO, RECENTLY_DELETED,
+            flatten_row, open_blob,
         },
     },
     util::{
         bundle_id::parse_balloon_bundle_id,
-        dates::{get_local_time, readable_diff},
+        dates::{readable_diff, to_utc},
         query_context::QueryContext,
         streamtyped,
     },
 };
 
-// MARK: Columns
-/// Columns selected by the newest message query shape.
-pub(crate) const COLS: &str = "rowid, guid, text, service, handle_id, destination_caller_id, subject, date, date_read, date_delivered, is_from_me, is_read, item_type, other_handle, share_status, share_direction, group_title, group_action_type, associated_message_guid, associated_message_type, balloon_bundle_id, expressive_send_style_id, thread_originator_guid, thread_originator_part, date_edited, associated_message_emoji";
-
-/// Row from the `message` table, plus body/edit metadata populated by [`parse_body`](Self::parse_body).
+/// Row from the `message` table, with body and edit metadata parsed during row decoding.
 #[derive(Debug)]
-#[allow(non_snake_case)]
 pub struct Message {
     /// Message row ID.
     pub rowid: i32,
     /// Message GUID.
     pub guid: String,
-    /// Plain body text. [`parse_body`](Self::parse_body) may populate this from `attributedBody`.
+    /// Plain body text, decoded from `attributedBody` when available.
     pub text: Option<String>,
     /// Raw service name.
     pub service: Option<String>,
@@ -200,14 +257,19 @@ pub struct Message {
     pub item_type: i32,
     /// Additional handle used by shared-location and group-action messages.
     pub other_handle: Option<i32>,
-    /// Shared-location active/inactive flag.
-    pub share_status: bool,
-    /// Shared-location direction flag.
-    pub share_direction: Option<bool>,
+    /// Shared-location status code: `0` when sharing started, `1` when it stopped.
+    pub share_status: i32,
+    /// Shared-location direction code.
+    pub share_direction: Option<i32>,
     /// Group title carried by group-name-change messages.
     pub group_title: Option<String>,
     /// Group action code.
     pub group_action_type: i32,
+    /// Message action code; on a kept-message row (`item_type` 5), the kind
+    /// of message kept ([`KeptMessage`]).
+    pub message_action_type: i32,
+    /// Messages' error code for the row; `0` for none.
+    pub error: i64,
     /// GUID of the message this row references.
     pub associated_message_guid: Option<String>,
     /// Type code for the associated message, used by [`variant`](Self::variant).
@@ -224,58 +286,77 @@ pub struct Message {
     pub date_edited: i64,
     /// Emoji associated with a custom emoji tapback.
     pub associated_message_emoji: Option<String>,
-    /// Chat row ID this message belongs to.
+    /// The [`rowid`](crate::tables::chat::Chat::rowid) of the chat this message belongs to.
+    ///
+    /// `None` for a recovered deleted message; most callers should prefer
+    /// [`chat_rowid()`](Self::chat_rowid).
     pub chat_id: Option<i32>,
     /// Number of attached files included in the message.
     pub num_attachments: i32,
-    /// The [`rowid`](crate::tables::chat::Chat::rowid) of the chat the message was deleted from
+    /// The [`rowid`](crate::tables::chat::Chat::rowid) of the chat the message was deleted from.
+    ///
+    /// Most callers should prefer [`chat_rowid()`](Self::chat_rowid).
     pub deleted_from: Option<i32>,
     /// Number of replies to the message.
     pub num_replies: i32,
+    /// Raw message filter category code, read by [`filter_action`](Self::filter_action).
+    pub filter_action: Option<i32>,
+    /// Raw message filter subcategory code. This field has no parsed representation.
+    pub filter_sub_action: Option<i32>,
     /// The components of the message body, parsed by a [`TypedStreamDeserializer`] or [`streamtyped::parse()`]
     pub components: Vec<BubbleComponent>,
     /// Parsed edit/unsent metadata from `message_summary_info`.
     pub edited_parts: Option<EditedMessage>,
+    /// `true` for a group event (`item_type` 1–3) with `true` or a nonzero
+    /// integer under `uat` in `message_summary_info`.
+    /// `false` for every other `item_type`.
+    pub is_unattributed: bool,
+    /// `conversationAVMode` from `message_summary_info` on a FaceTime or
+    /// SharePlay row (`item_type` 6). `None` for every other `item_type`, and
+    /// when the key is absent or not an unsigned integer. The default mode
+    /// in Messages for an absent key is [`ConversationAVMode::Video`].
+    pub conversation_av_mode: Option<ConversationAVMode>,
 }
 
-/// Body data returned by [`Message::parse_body`].
-///
-/// Use [`Message::apply_body()`] to apply the parsed body back to the message:
-///
-/// ```no_run
-/// # use imessage_database::tables::{messages::Message, table::get_connection};
-/// # use imessage_database::util::dirs::default_db_path;
-/// # let conn = get_connection(&default_db_path()).unwrap();
-/// # let mut message = Message::from_guid("example", &conn).unwrap();
-/// if let Ok(body) = message.parse_body(&conn) {
-///     message.apply_body(body);
-/// }
-/// ```
-#[derive(Debug)]
-#[must_use]
-pub struct ParsedBody {
-    /// Plain body text.
-    pub text: Option<String>,
-    /// Parsed body components.
-    pub components: Vec<BubbleComponent>,
-    /// Parsed edit/unsent metadata.
-    pub edited_parts: Option<EditedMessage>,
-    /// Resolved balloon bundle ID.
-    pub balloon_bundle_id: Option<String>,
-}
-
-// MARK: Table
-impl Table for Message {
-    fn from_row(row: &Row) -> Result<Message> {
-        Self::from_row_idx(row).or_else(|_| Self::from_row_named(row))
+// MARK: Rows
+impl Message {
+    /// Resolve the column layout after the first step, then deserialize every
+    /// row by ordinal. Pass either a [`rusqlite::Statement`] or a
+    /// [`rusqlite::CachedStatement`] (via deref coercion).
+    ///
+    /// If a required column is absent, return [`TableError::QueryError`] for
+    /// every row. Failed layout resolutions are not cached: retry resolution
+    /// after each step.
+    ///
+    /// Resolve through the first [`Row`](rusqlite::Row) to use metadata after
+    /// `sqlite3_step`: if the schema changed after preparation, the statement
+    /// may be recompiled during that step.
+    pub fn rows<'stmt, P: Params>(
+        stmt: &'stmt mut Statement<'_>,
+        params: P,
+    ) -> Result<impl Iterator<Item = Result<Self, TableError>> + 'stmt, TableError>
+    where
+        Self: 'stmt,
+    {
+        let mut layout = None;
+        let mapped = stmt.query_map(params, move |row| {
+            let columns = match layout.as_ref() {
+                Some(columns) => columns,
+                None => layout.insert(MessageColumns::resolve(row.as_ref())?),
+            };
+            Ok(Self::from_row_mapped(row, columns))
+        })?;
+        Ok(mapped.map(flatten_row))
     }
 
-    /// Prepare the newest compatible message query, falling back through older schemas.
-    fn get(db: &'_ Connection) -> Result<CachedStatement<'_>, TableError> {
-        Ok(db
-            .prepare_cached(&ios_16_newer_query(None))
-            .or_else(|_| db.prepare_cached(&ios_14_15_query(None)))
-            .or_else(|_| db.prepare_cached(&ios_13_older_query(None)))?)
+    /// Resolve the stepped row's column layout, then deserialize by ordinal.
+    /// Return [`TableError::QueryError`] if no row is found, a required column
+    /// is absent, or deserialization fails.
+    pub fn row<P: Params>(stmt: &mut Statement<'_>, params: P) -> Result<Self, TableError> {
+        flatten_row(stmt.query_row(params, |row| {
+            let columns = MessageColumns::resolve(row.as_ref())?;
+            Ok(Self::from_row_mapped(row, &columns))
+        }))
     }
 }
 
@@ -290,7 +371,7 @@ impl Message {
     /// use imessage_database::tables::table::get_connection;
     /// use imessage_database::tables::messages::Message;
     ///
-    /// let db_path = default_db_path();
+    /// let db_path = default_db_path().unwrap();
     /// let conn = get_connection(&db_path).unwrap();
     /// Message::run_diagnostic(&conn);
     /// ```
@@ -370,9 +451,7 @@ impl Message {
 }
 
 // MARK: Cache
-impl Cacheable for Message {
-    type K = String;
-    type V = HashMap<usize, Vec<Self>>;
+impl Message {
     /// Cache tapback messages by target message GUID and body component index.
     ///
     /// Builds a map like:
@@ -387,49 +466,40 @@ impl Cacheable for Message {
     /// ```
     ///
     /// The `0` and `1` keys are component indexes in the target message body.
-    fn cache(db: &Connection) -> Result<HashMap<Self::K, Self::V>, TableError> {
-        // Create cache for user IDs
-        let mut map: HashMap<Self::K, Self::V> = HashMap::new();
+    /// Return an empty map without querying if `associated_message_guid` is
+    /// absent from the schema.
+    pub fn tapbacks_by_target(
+        db: &Connection,
+        capabilities: &Capabilities,
+    ) -> Result<HashMap<String, HashMap<usize, Vec<Message>>>, TableError> {
+        let mut map: HashMap<String, HashMap<usize, Vec<Message>>> = HashMap::new();
 
-        // Create query
-        let statement = db.prepare(&format!(
-            "SELECT
-                 {COLS},
-                 c.chat_id,
-                 (SELECT COUNT(*) FROM {MESSAGE_ATTACHMENT_JOIN} a WHERE m.ROWID = a.message_id) as num_attachments,
-                 NULL as deleted_from,
-                 0 as num_replies
-             FROM
-                 {MESSAGE} as m
-             LEFT JOIN {CHAT_MESSAGE_JOIN} as c ON m.ROWID = c.message_id
-             WHERE m.associated_message_guid IS NOT NULL
-            "
-        )).or_else(|_| db.prepare(&format!(
-            "SELECT
-                 *,
-                 c.chat_id,
-                 (SELECT COUNT(*) FROM {MESSAGE_ATTACHMENT_JOIN} a WHERE m.ROWID = a.message_id) as num_attachments,
-                 NULL as deleted_from,
-                 0 as num_replies
-             FROM
-                 {MESSAGE} as m
-             LEFT JOIN {CHAT_MESSAGE_JOIN} as c ON m.ROWID = c.message_id
-             WHERE m.associated_message_guid IS NOT NULL
-            "
-        )));
+        if !capabilities.associated_message_guids {
+            return Ok(map);
+        }
 
-        if let Ok(mut statement) = statement {
-            for message in Self::rows(&mut statement, [])? {
-                let message = message?;
-                if message.is_tapback()
-                    && let Some((idx, tapback_target_guid)) = message.clean_associated_guid()
-                {
-                    map.entry(tapback_target_guid.to_string())
-                        .or_insert_with(HashMap::new)
-                        .entry(idx)
-                        .or_insert_with(Vec::new)
-                        .push(message);
-                }
+        // The cache only maps each tapback to its target GUID and component
+        // index, and tapback rendering never reads a body, so this full scan
+        // skips the derived features' correlated subqueries and join and the
+        // body inputs' blob reads and typedstream decode.
+        let cache_capabilities = capabilities
+            .without_derived_features()
+            .without_body_inputs();
+        let mut statement = db.prepare_cached(&message_query(
+            &cache_capabilities,
+            Some("WHERE m.associated_message_guid IS NOT NULL"),
+        ))?;
+
+        for message in Self::rows(&mut statement, [])? {
+            let message = message?;
+            if message.is_tapback()
+                && let Some((idx, tapback_target_guid)) = message.clean_associated_guid()
+            {
+                map.entry(tapback_target_guid.to_string())
+                    .or_default()
+                    .entry(idx)
+                    .or_default()
+                    .push(message);
             }
         }
 
@@ -437,120 +507,73 @@ impl Cacheable for Message {
     }
 }
 
+/// Decode an unsigned `conversationAVMode` integer from `message_summary_info`.
+fn read_av_mode(summary: &Value) -> Option<ConversationAVMode> {
+    ConversationAVMode::from_code(
+        summary
+            .as_dictionary()?
+            .get("conversationAVMode")?
+            .as_unsigned_integer(),
+    )
+}
+
+/// `true` for `true` or a nonzero integer under `uat` in `message_summary_info`.
+fn marks_unattributed(summary: &Value) -> bool {
+    match summary.as_dictionary().and_then(|dict| dict.get("uat")) {
+        Some(Value::Boolean(flag)) => *flag,
+        Some(Value::Integer(int)) => int.as_signed() != Some(0),
+        _ => false,
+    }
+}
+
 // MARK: Impl
 impl Message {
-    /// Build a [`Message`] from a row using indexed columns.
-    fn from_row_idx(row: &Row) -> Result<Message> {
-        Ok(Message {
-            rowid: row.get(0)?,
-            guid: row.get(1)?,
-            text: row.get(2).unwrap_or(None),
-            service: row.get(3).unwrap_or(None),
-            handle_id: row.get(4).unwrap_or(None),
-            destination_caller_id: row.get(5).unwrap_or(None),
-            subject: row.get(6).unwrap_or(None),
-            date: row.get(7)?,
-            date_read: row.get(8).unwrap_or(0),
-            date_delivered: row.get(9).unwrap_or(0),
-            is_from_me: row.get(10)?,
-            is_read: row.get(11).unwrap_or(false),
-            item_type: row.get(12).unwrap_or_default(),
-            other_handle: row.get(13).unwrap_or(None),
-            share_status: row.get(14).unwrap_or(false),
-            share_direction: row.get(15).unwrap_or(None),
-            group_title: row.get(16).unwrap_or(None),
-            group_action_type: row.get(17).unwrap_or(0),
-            associated_message_guid: row.get(18).unwrap_or(None),
-            associated_message_type: row.get(19).unwrap_or(None),
-            balloon_bundle_id: row.get(20).unwrap_or(None),
-            expressive_send_style_id: row.get(21).unwrap_or(None),
-            thread_originator_guid: row.get(22).unwrap_or(None),
-            thread_originator_part: row.get(23).unwrap_or(None),
-            date_edited: row.get(24).unwrap_or(0),
-            associated_message_emoji: row.get(25).unwrap_or(None),
-            chat_id: row.get(26).unwrap_or(None),
-            num_attachments: row.get(27)?,
-            deleted_from: row.get(28).unwrap_or(None),
-            num_replies: row.get(29)?,
-            components: vec![],
-            edited_parts: None,
-        })
-    }
-
-    /// Build a [`Message`] from a row using named columns.
-    fn from_row_named(row: &Row) -> Result<Message> {
-        Ok(Message {
-            rowid: row.get("rowid")?,
-            guid: row.get("guid")?,
-            text: row.get("text").unwrap_or(None),
-            service: row.get("service").unwrap_or(None),
-            handle_id: row.get("handle_id").unwrap_or(None),
-            destination_caller_id: row.get("destination_caller_id").unwrap_or(None),
-            subject: row.get("subject").unwrap_or(None),
-            date: row.get("date")?,
-            date_read: row.get("date_read").unwrap_or(0),
-            date_delivered: row.get("date_delivered").unwrap_or(0),
-            is_from_me: row.get("is_from_me")?,
-            is_read: row.get("is_read").unwrap_or(false),
-            item_type: row.get("item_type").unwrap_or_default(),
-            other_handle: row.get("other_handle").unwrap_or(None),
-            share_status: row.get("share_status").unwrap_or(false),
-            share_direction: row.get("share_direction").unwrap_or(None),
-            group_title: row.get("group_title").unwrap_or(None),
-            group_action_type: row.get("group_action_type").unwrap_or(0),
-            associated_message_guid: row.get("associated_message_guid").unwrap_or(None),
-            associated_message_type: row.get("associated_message_type").unwrap_or(None),
-            balloon_bundle_id: row.get("balloon_bundle_id").unwrap_or(None),
-            expressive_send_style_id: row.get("expressive_send_style_id").unwrap_or(None),
-            thread_originator_guid: row.get("thread_originator_guid").unwrap_or(None),
-            thread_originator_part: row.get("thread_originator_part").unwrap_or(None),
-            date_edited: row.get("date_edited").unwrap_or(0),
-            associated_message_emoji: row.get("associated_message_emoji").unwrap_or(None),
-            chat_id: row.get("chat_id").unwrap_or(None),
-            num_attachments: row.get("num_attachments")?,
-            deleted_from: row.get("deleted_from").unwrap_or(None),
-            num_replies: row.get("num_replies")?,
-            components: vec![],
-            edited_parts: None,
-        })
-    }
-
     // MARK: Text Gen
-    /// Parse the body of a message, deserializing it as [`typedstream`](crate::util::typedstream)
-    /// (and falling back to [`streamtyped`]) data if necessary.
+    /// Populate body fields from supplied bytes without reading the database.
     ///
-    /// This method performs pure parsing without mutating the message. Use [`Self::apply_body()`]
-    /// to apply the result back to the message.
+    /// Use `None` for an absent or unreadable input. `has_payload` is the
+    /// non-nullness of `payload_data`, including non-blob values.
+    /// Parse summary bytes only for:
     ///
-    /// # Example
+    /// - edited messages ([`Self::is_edited`]), to populate [`Self::edited_parts`];
+    /// - group events (`item_type` 1–3), to populate [`Self::is_unattributed`];
+    /// - FaceTime or SharePlay rows (`item_type` 6), to populate [`Self::conversation_av_mode`].
     ///
-    /// ```no_run
-    /// # use imessage_database::tables::{messages::Message, table::get_connection};
-    /// # use imessage_database::util::dirs::default_db_path;
-    /// # let conn = get_connection(&default_db_path()).unwrap();
-    /// # let mut message = Message::from_guid("example", &conn).unwrap();
-    /// if let Ok(body) = message.parse_body(&conn) {
-    ///     message.apply_body(body);
-    /// }
-    /// ```
-    pub fn parse_body(&self, db: &Connection) -> Result<ParsedBody, MessageError> {
-        // Parse the edited message data
-        let edited_parts = self
-            .is_edited()
-            .then(|| self.message_summary_info(db))
+    /// Parsing is best effort: preserve parsed body components and edit
+    /// metadata if text cannot be recovered.
+    pub(super) fn parse_body(
+        &mut self,
+        attributed_body: Option<&[u8]>,
+        message_summary_info: Option<&[u8]>,
+        has_payload: bool,
+    ) {
+        // Check whether summary fields are needed before parsing the plist: we decode every row here.
+        let is_group_event = matches!(self.item_type, 1..=3);
+        let is_shareplay = self.is_shareplay();
+        let is_edited = self.is_edited();
+        let summary = (is_group_event || is_shareplay || is_edited)
+            .then_some(message_summary_info)
             .flatten()
+            .and_then(|bytes| Value::from_reader(Cursor::new(bytes)).ok());
+
+        let edited_parts = summary
             .as_ref()
+            .filter(|_| is_edited)
             .and_then(|payload| EditedMessage::from_map(payload).ok());
+        let is_unattributed = is_group_event && summary.as_ref().is_some_and(marks_unattributed);
+        let conversation_av_mode = summary
+            .as_ref()
+            .filter(|_| is_shareplay)
+            .and_then(read_av_mode);
 
         // Initialize variables for the text, components, and balloon bundle ID that will be parsed from the body
         let mut text = None;
         let mut components = vec![];
         let mut balloon_bundle_id = None;
 
-        // Grab the body data from the table
-        if let Some(body) = self.attributed_body(db) {
+        if let Some(body) = attributed_body {
             // Attempt to deserialize the typedstream data
-            let mut typedstream = TypedStreamDeserializer::new(&body);
+            let mut typedstream = TypedStreamDeserializer::new(body);
             match parse_body_typedstream(typedstream.iter_root().ok(), edited_parts.as_ref()) {
                 Some(parsed) => {
                     text = parsed.text;
@@ -570,9 +593,7 @@ impl Message {
                     // App payloads render as a single app component.
                     if self.balloon_bundle_id.is_some() {
                         components = vec![BubbleComponent::App];
-                    } else if is_single_url
-                        && self.has_blob(db, MESSAGE, MESSAGE_PAYLOAD, self.rowid.into())
-                    {
+                    } else if is_single_url && has_payload {
                         // URL previews may omit `balloon_bundle_id` while still carrying
                         // preview payload data.
                         balloon_bundle_id =
@@ -588,9 +609,9 @@ impl Message {
                 }
             }
 
-            // The legacy parser can still recover text from older attributed bodies.
+            // A failed legacy parse must not discard valid components or edit metadata.
             if text.is_none() {
-                text = Some(streamtyped::parse(body)?);
+                text = streamtyped::parse(body.to_vec()).ok();
             }
         }
 
@@ -605,85 +626,45 @@ impl Message {
             components = parse_body_legacy(&text);
         }
 
-        // Fully unsent messages can have edit metadata without remaining text.
-        if text.is_some() || !components.is_empty() || edited_parts.is_some() {
-            Ok(ParsedBody {
-                text,
-                components,
-                edited_parts,
-                balloon_bundle_id,
-            })
-        } else {
-            Err(MessageError::NoText)
-        }
-    }
-
-    /// Apply a [`ParsedBody`] to this message, setting its text, components,
-    /// edited parts, and balloon bundle ID.
-    pub fn apply_body(&mut self, body: ParsedBody) {
-        self.text = body.text;
-        self.components = body.components;
-        self.edited_parts = body.edited_parts;
-        self.balloon_bundle_id = body.balloon_bundle_id;
-    }
-
-    /// Parse text with the legacy parser only.
-    ///
-    /// This ignores typedstream attributes and does not preserve every modern message type.
-    pub fn generate_text_legacy<'a>(
-        &'a mut self,
-        db: &'a Connection,
-    ) -> Result<&'a str, MessageError> {
-        // If the text is missing, try and query for it
-        if self.text.is_none()
-            && let Some(body) = self.attributed_body(db)
-        {
-            self.text = Some(streamtyped::parse(body)?);
-        }
-
-        // Fallback component parser as well
-        if self.components.is_empty() {
-            self.components = parse_body_legacy(&self.text);
-        }
-
-        self.text.as_deref().ok_or(MessageError::NoText)
+        self.text = text;
+        self.components = components;
+        self.edited_parts = edited_parts;
+        self.balloon_bundle_id = balloon_bundle_id;
+        self.is_unattributed = is_unattributed;
+        self.conversation_av_mode = conversation_av_mode;
     }
 
     // MARK: Dates
-    /// Convert [`date`](Self::date) to local time.
+    /// Decode [`date`](Self::date) to an instant.
     ///
-    /// This field is stored as a unix timestamp with an epoch of `2001-01-01 00:00:00` in the local time zone
-    ///
-    /// `offset` can be provided by [`get_offset`](crate::util::dates::get_offset) or manually.
-    pub fn date(&self, offset: i64) -> Result<DateTime<Local>, MessageError> {
-        get_local_time(self.date, offset)
+    /// Stored as nanoseconds (seconds in older rows) since the Messages epoch,
+    /// `2001-01-01 00:00:00` UTC. Call `with_timezone()` to render in another zone.
+    pub fn date(&self) -> Result<DateTime<Utc>, MessageError> {
+        to_utc(self.date)
     }
 
-    /// Convert [`date_delivered`](Self::date_delivered) to local time.
+    /// Decode [`date_delivered`](Self::date_delivered) to an instant.
     ///
-    /// This field is stored as a unix timestamp with an epoch of `2001-01-01 00:00:00` in the local time zone
-    ///
-    /// `offset` can be provided by [`get_offset`](crate::util::dates::get_offset) or manually.
-    pub fn date_delivered(&self, offset: i64) -> Result<DateTime<Local>, MessageError> {
-        get_local_time(self.date_delivered, offset)
+    /// Stored as nanoseconds (seconds in older rows) since the Messages epoch,
+    /// `2001-01-01 00:00:00` UTC. Call `with_timezone()` to render in another zone.
+    pub fn date_delivered(&self) -> Result<DateTime<Utc>, MessageError> {
+        to_utc(self.date_delivered)
     }
 
-    /// Convert [`date_read`](Self::date_read) to local time.
+    /// Decode [`date_read`](Self::date_read) to an instant.
     ///
-    /// This field is stored as a unix timestamp with an epoch of `2001-01-01 00:00:00` in the local time zone
-    ///
-    /// `offset` can be provided by [`get_offset`](crate::util::dates::get_offset) or manually.
-    pub fn date_read(&self, offset: i64) -> Result<DateTime<Local>, MessageError> {
-        get_local_time(self.date_read, offset)
+    /// Stored as nanoseconds (seconds in older rows) since the Messages epoch,
+    /// `2001-01-01 00:00:00` UTC. Call `with_timezone()` to render in another zone.
+    pub fn date_read(&self) -> Result<DateTime<Utc>, MessageError> {
+        to_utc(self.date_read)
     }
 
-    /// Convert [`date_edited`](Self::date_edited) to local time.
+    /// Decode [`date_edited`](Self::date_edited) to an instant.
     ///
-    /// This field is stored as a unix timestamp with an epoch of `2001-01-01 00:00:00` in the local time zone
-    ///
-    /// `offset` can be provided by [`get_offset`](crate::util::dates::get_offset) or manually.
-    pub fn date_edited(&self, offset: i64) -> Result<DateTime<Local>, MessageError> {
-        get_local_time(self.date_edited, offset)
+    /// Stored as nanoseconds (seconds in older rows) since the Messages epoch,
+    /// `2001-01-01 00:00:00` UTC. Call `with_timezone()` to render in another zone.
+    pub fn date_edited(&self) -> Result<DateTime<Utc>, MessageError> {
+        to_utc(self.date_edited)
     }
 
     /// Calculate the elapsed time until the message was read or delivered.
@@ -700,16 +681,23 @@ impl Message {
     /// If more than one message has been sent in a thread before getting read,
     /// only the most recent message will get the tag.
     ///
-    /// `offset` can be provided by [`get_offset`](crate::util::dates::get_offset) or manually.
+    /// Use the calendar in `zone` to count whole years; see
+    /// [`readable_diff`](crate::util::dates::readable_diff).
     #[must_use]
-    pub fn time_until_read(&self, offset: i64) -> Option<String> {
+    pub fn time_until_read<Tz: TimeZone>(&self, zone: &Tz) -> Option<String> {
         // Message we received
         if !self.is_from_me && self.date_read != 0 && self.date != 0 {
-            return readable_diff(&self.date(offset).ok()?, &self.date_read(offset).ok()?);
+            return readable_diff(
+                &self.date().ok()?.with_timezone(zone),
+                &self.date_read().ok()?.with_timezone(zone),
+            );
         }
         // Message we sent
         else if self.is_from_me && self.date_delivered != 0 && self.date != 0 {
-            return readable_diff(&self.date(offset).ok()?, &self.date_delivered(offset).ok()?);
+            return readable_diff(
+                &self.date().ok()?.with_timezone(zone),
+                &self.date_delivered().ok()?.with_timezone(zone),
+            );
         }
         None
     }
@@ -745,13 +733,13 @@ impl Message {
         matches!(self.variant(), Variant::App(CustomBalloon::URL))
     }
 
-    /// `true` when the message is a [`HandwrittenMessage`](crate::message_types::handwriting::models::HandwrittenMessage).
+    /// `true` when the message is a [`HandwrittenMessage`](crate::message_types::handwriting::HandwrittenMessage).
     #[must_use]
     pub fn is_handwriting(&self) -> bool {
         matches!(self.variant(), Variant::App(CustomBalloon::Handwriting))
     }
 
-    /// `true` when the message is a [`Digital Touch`](crate::message_types::digital_touch::models) message.
+    /// `true` when the message is a [`Digital Touch`](crate::message_types::digital_touch) message.
     #[must_use]
     pub fn is_digital_touch(&self) -> bool {
         matches!(self.variant(), Variant::App(CustomBalloon::DigitalTouch))
@@ -816,10 +804,19 @@ impl Message {
         self.num_replies > 0
     }
 
-    /// `true` when the message indicates a sent audio message was kept.
+    /// `true` for kept-message rows (`item_type` 5).
     #[must_use]
-    pub fn is_kept_audio_message(&self) -> bool {
+    pub fn is_kept_message(&self) -> bool {
         self.item_type == 5
+    }
+
+    /// `true` for a failed group event: `item_type` 1–3 with nonzero low 32
+    /// bits in [`error`](Self::error), matching the check in Messages.
+    /// `false` for every other row: we have not verified the meaning of
+    /// nonzero `error` values for other item types.
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        matches!(self.item_type, 1..=3) && self.error & 0xFFFF_FFFF != 0
     }
 
     /// `true` when the message is a [SharePlay/FaceTime](crate::message_types::variants::Variant::SharePlay) message.
@@ -837,24 +834,27 @@ impl Message {
             && let (Some(other_handle), Some(share_direction)) =
                 (self.other_handle, self.share_direction)
         {
-            self.is_from_me || other_handle != 0 && !share_direction
+            self.is_from_me || other_handle != 0 && share_direction == 0
         } else {
             self.is_from_me
         }
     }
 
-    /// Returns the [`SharedLocation`] when the message is a legacy
-    /// shared-location event.
+    /// Return the [`SharedLocation`] for a legacy shared-location event.
+    ///
+    /// Return `None` unless [`share_status`](Self::share_status) and
+    /// [`share_direction`](Self::share_direction) are both `0` or `1`: those
+    /// are the only pairs with started or stopped text in Messages. Treat a
+    /// `NULL` direction as `0`, matching an integer read of `NULL`.
     #[must_use]
     pub fn shared_location_kind(&self) -> Option<SharedLocation> {
-        if self.item_type == 4 && self.group_action_type == 0 {
-            Some(if self.share_status {
-                SharedLocation::Stopped
-            } else {
-                SharedLocation::Started
-            })
-        } else {
-            None
+        if self.item_type != 4 || !matches!(self.share_direction, None | Some(0 | 1)) {
+            return None;
+        }
+        match self.share_status {
+            0 => Some(SharedLocation::Started),
+            1 => Some(SharedLocation::Stopped),
+            _ => None,
         }
     }
 
@@ -872,6 +872,17 @@ impl Message {
     #[must_use]
     pub fn is_deleted(&self) -> bool {
         self.deleted_from.is_some()
+    }
+
+    /// The [`rowid`](crate::tables::chat::Chat::rowid) of the chat this message belongs to.
+    ///
+    /// A recovered deleted message has no `chat_message_join` row, so its
+    /// [`chat_id`](Self::chat_id) is `None` and [`deleted_from`](Self::deleted_from)
+    /// is the only reference to its chat. Resolve a message's chat through this
+    /// method so its transcript and attachments land in the same conversation.
+    #[must_use]
+    pub fn chat_rowid(&self) -> Option<i32> {
+        self.chat_id.or(self.deleted_from)
     }
 
     /// `true` when the message summary includes translation metadata.
@@ -998,37 +1009,35 @@ impl Message {
     /// # Example
     ///
     /// ```no_run
+    /// use imessage_database::tables::{
+    ///     capabilities::Capabilities,
+    ///     messages::Message,
+    ///     table::get_connection,
+    /// };
     /// use imessage_database::util::dirs::default_db_path;
-    /// use imessage_database::tables::table::get_connection;
-    /// use imessage_database::tables::messages::Message;
     /// use imessage_database::util::query_context::QueryContext;
     ///
-    /// let db_path = default_db_path();
+    /// let db_path = default_db_path().unwrap();
     /// let conn = get_connection(&db_path).unwrap();
+    /// let capabilities = Capabilities::determine(&conn).unwrap();
     /// let context = QueryContext::default();
-    /// Message::get_count(&conn, &context);
+    /// Message::get_count(&conn, &capabilities, &context);
     /// ```
-    pub fn get_count(db: &Connection, context: &QueryContext) -> Result<i64, TableError> {
+    pub fn get_count(
+        db: &Connection,
+        capabilities: &Capabilities,
+        context: &QueryContext,
+    ) -> Result<i64, TableError> {
+        // The unfiltered count skips the chat join: `chat_message_join` can
+        // associate one message with several chats, and every extra
+        // association would inflate `COUNT(*)`.
         let mut statement = if context.has_filters() {
+            let filters =
+                Self::generate_filter_statement(context, capabilities.recoverable_messages);
             db.prepare_cached(&format!(
-                "SELECT
-                     COUNT(*)
-                 FROM {MESSAGE} as m
-                 LEFT JOIN {CHAT_MESSAGE_JOIN} as c ON m.ROWID = c.message_id
-                 LEFT JOIN {RECENTLY_DELETED} as d ON m.ROWID = d.message_id
-                 {}",
-                Self::generate_filter_statement(context, true)
-            ))
-            .or_else(|_| {
-                db.prepare_cached(&format!(
-                    "SELECT
-                         COUNT(*)
-                     FROM {MESSAGE} as m
-                     LEFT JOIN {CHAT_MESSAGE_JOIN} as c ON m.ROWID = c.message_id
-                    {}",
-                    Self::generate_filter_statement(context, false)
-                ))
-            })?
+                "SELECT COUNT(*){}\n{filters}",
+                from_clause(capabilities)
+            ))?
         } else {
             db.prepare_cached(&format!("SELECT COUNT(*) FROM {MESSAGE}"))?
         };
@@ -1043,16 +1052,20 @@ impl Message {
     /// # Example
     ///
     /// ```no_run
+    /// use imessage_database::tables::{
+    ///     capabilities::Capabilities,
+    ///     messages::Message,
+    ///     table::get_connection,
+    /// };
     /// use imessage_database::util::dirs::default_db_path;
-    /// use imessage_database::tables::table::get_connection;
-    /// use imessage_database::tables::{messages::Message, table::Table};
     /// use imessage_database::util::query_context::QueryContext;
     ///
-    /// let db_path = default_db_path();
+    /// let db_path = default_db_path().unwrap();
     /// let conn = get_connection(&db_path).unwrap();
+    /// let capabilities = Capabilities::determine(&conn).unwrap();
     /// let context = QueryContext::default();
     ///
-    /// let mut statement = Message::stream_rows(&conn, &context).unwrap();
+    /// let mut statement = Message::stream_rows(&conn, &capabilities, &context).unwrap();
     ///
     /// for message in Message::rows(&mut statement, []).unwrap() {
     ///     println!("{:#?}", message);
@@ -1060,25 +1073,13 @@ impl Message {
     /// ```
     pub fn stream_rows<'a>(
         db: &'a Connection,
+        capabilities: &Capabilities,
         context: &'a QueryContext,
     ) -> Result<CachedStatement<'a>, TableError> {
-        if !context.has_filters() {
-            return Self::get(db);
-        }
-        Ok(db
-            .prepare_cached(&ios_16_newer_query(Some(&Self::generate_filter_statement(
-                context, true,
-            ))))
-            .or_else(|_| {
-                db.prepare_cached(&ios_14_15_query(Some(&Self::generate_filter_statement(
-                    context, false,
-                ))))
-            })
-            .or_else(|_| {
-                db.prepare_cached(&ios_13_older_query(Some(&Self::generate_filter_statement(
-                    context, false,
-                ))))
-            })?)
+        let filters = context
+            .has_filters()
+            .then(|| Self::generate_filter_statement(context, capabilities.recoverable_messages));
+        prepare_message_query(db, capabilities, filters.as_deref())
     }
 
     /// Parse the target body component index and GUID from `associated_message_guid`.
@@ -1111,18 +1112,20 @@ impl Message {
     }
 
     /// Group replies by target body component index.
-    pub fn get_replies(&self, db: &Connection) -> Result<HashMap<usize, Vec<Self>>, TableError> {
+    pub fn get_replies(
+        &self,
+        db: &Connection,
+        capabilities: &Capabilities,
+    ) -> Result<HashMap<usize, Vec<Self>>, TableError> {
         let mut out_h: HashMap<usize, Vec<Self>> = HashMap::new();
 
-        // No need to hit the DB if we know we don't have replies
+        // No need to hit the DB if we know we don't have replies. A nonzero
+        // `num_replies` also proves the schema has `thread_originator_guid`,
+        // so the filter below always prepares.
         if self.has_replies() {
             // Use a parameterized filter so the prepared statement can be cached/reused
             let filters = "WHERE m.thread_originator_guid = ?1";
-
-            // `thread_originator_guid` is absent from the iOS 13-era schema.
-            let mut statement = db
-                .prepare_cached(&ios_16_newer_query(Some(filters)))
-                .or_else(|_| db.prepare_cached(&ios_14_15_query(Some(filters))))?;
+            let mut statement = prepare_message_query(db, capabilities, Some(filters))?;
 
             for message in Message::rows(&mut statement, [self.guid.as_str()])? {
                 let m = message?;
@@ -1141,18 +1144,20 @@ impl Message {
 
     // MARK: Polls
     /// Load messages that vote on or update the parent poll.
-    pub fn get_votes(&self, db: &Connection) -> Result<Vec<Self>, TableError> {
+    pub fn get_votes(
+        &self,
+        db: &Connection,
+        capabilities: &Capabilities,
+    ) -> Result<Vec<Self>, TableError> {
         let mut out_v: Vec<Self> = Vec::new();
 
-        // No need to hit the DB if we know we don't have a poll
+        // No need to hit the DB if we know we don't have a poll. Polls carry
+        // app payload data, which postdates `associated_message_guid`, so the
+        // filter below always prepares.
         if self.is_poll() {
             // Use a parameterized filter so the prepared statement can be cached/reused
             let filters = "WHERE m.associated_message_guid = ?1";
-
-            // `associated_message_guid` is absent from the iOS 13-era schema.
-            let mut statement = db
-                .prepare_cached(&ios_16_newer_query(Some(filters)))
-                .or_else(|_| db.prepare_cached(&ios_14_15_query(Some(filters))))?;
+            let mut statement = prepare_message_query(db, capabilities, Some(filters))?;
 
             for message in Message::rows(&mut statement, [self.guid.as_str()])? {
                 out_v.push(message?);
@@ -1163,14 +1168,18 @@ impl Message {
     }
 
     /// Parse this message as a poll, including vote counts and option updates.
-    pub fn as_poll(&self, db: &Connection) -> Result<Option<Poll>, MessageError> {
+    pub fn as_poll(
+        &self,
+        db: &Connection,
+        capabilities: &Capabilities,
+    ) -> Result<Option<Poll>, MessageError> {
         if self.is_poll()
             && let Some(payload) = self.payload_data(db)
         {
             let mut poll = Poll::from_payload(&payload)?;
 
             // Get all votes associated with this poll
-            let votes = self.get_votes(db).unwrap_or_default();
+            let votes = self.get_votes(db, capabilities).unwrap_or_default();
 
             // Later poll-option updates are stored as messages referencing the original poll.
             for vote in votes.iter().rev() {
@@ -1247,6 +1256,7 @@ impl Message {
             "com.apple.mobileslideshow.PhotosMessagesApp" => CustomBalloon::Slideshow,
             "com.apple.SafetyMonitorApp.SafetyMonitorMessages" => CustomBalloon::CheckIn,
             "com.apple.findmy.FindMyMessagesApp" => CustomBalloon::FindMy,
+            "com.apple.icloud.apps.messages.business.extension" => CustomBalloon::Business,
             "com.apple.messages.Polls" => {
                 // Special case: Check if this is the original poll or an update
                 if self
@@ -1306,17 +1316,44 @@ impl Message {
             return Some(Announcement::FullyUnsent);
         }
 
-        if self.is_kept_audio_message() {
-            return Some(Announcement::AudioMessageKept);
+        if self.is_kept_message() {
+            return Some(Announcement::MessageKept(KeptMessage::from_code(
+                self.message_action_type,
+            )));
         }
 
-        None
+        let unknown = match self.item_type {
+            // All type-2 rows are handled in `group_action`; only unmapped type-1 and type-3
+            // group events remain here.
+            1 | 3 => UnknownEvent::Group {
+                item_type: self.item_type,
+                group_action_type: self.group_action_type,
+            },
+            4 if self.shared_location_kind().is_none() => UnknownEvent::Location {
+                share_status: self.share_status,
+                share_direction: self.share_direction,
+            },
+            7 => return Some(Announcement::TranscriptSharingStopped),
+            8 => return Some(Announcement::EmergencyLocationSent),
+            0..=6 => return None,
+            other => UnknownEvent::ItemType(other),
+        };
+        Some(Announcement::UnknownEvent(unknown))
     }
 
     /// Parse the message service.
     #[must_use]
     pub fn service(&'_ self) -> Service<'_> {
         Service::from_name(self.service.as_deref())
+    }
+
+    /// Parse the message's raw filter category.
+    ///
+    /// A raw `0` maps to [`FilterAction::Unfiltered`]; an absent or `NULL` value
+    /// maps to `None`.
+    #[must_use]
+    pub fn filter_action(&self) -> Option<FilterAction> {
+        FilterAction::from_code(self.filter_action)
     }
 
     // MARK: BLOBs
@@ -1338,7 +1375,7 @@ impl Message {
     /// This column contains data used by [`HandwrittenMessage`](crate::message_types::handwriting::HandwrittenMessage)s.
     pub fn raw_payload_data(&self, db: &Connection) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
-        self.get_blob(db, MESSAGE, MESSAGE_PAYLOAD, self.rowid.into())?
+        open_blob(db, MESSAGE, MESSAGE_PAYLOAD, self.rowid.into())?
             .read_to_end(&mut buf)
             .ok()?;
         Some(buf)
@@ -1352,23 +1389,10 @@ impl Message {
     pub fn message_summary_info(&self, db: &Connection) -> Option<Value> {
         // Bulk-read the blob, then parse from memory.
         let mut buf = Vec::new();
-        self.get_blob(db, MESSAGE, MESSAGE_SUMMARY_INFO, self.rowid.into())?
+        open_blob(db, MESSAGE, MESSAGE_SUMMARY_INFO, self.rowid.into())?
             .read_to_end(&mut buf)
             .ok()?;
         Value::from_reader(Cursor::new(buf)).ok()
-    }
-
-    /// Get a message's [typedstream](crate::util::typedstream) from the [`ATTRIBUTED_BODY`] BLOB column
-    ///
-    /// Calling this reads a `BLOB` from the database.
-    ///
-    /// This column contains the message's body text with any other attributes.
-    pub fn attributed_body(&self, db: &Connection) -> Option<Vec<u8>> {
-        let mut body = vec![];
-        self.get_blob(db, MESSAGE, ATTRIBUTED_BODY, self.rowid.into())?
-            .read_to_end(&mut body)
-            .ok();
-        Some(body)
     }
 
     // MARK: Expressive
@@ -1420,31 +1444,37 @@ impl Message {
 
     /// Query a single message by [`GUID`](Self::guid).
     ///
+    /// The returned message includes parsed [`components`](Self::components)
+    /// and [`edited_parts`](Self::edited_parts) when available. Body parsing
+    /// failures preserve the row's metadata.
+    ///
     /// # Example
     /// ```no_run
     /// use imessage_database::{
     ///     tables::{
+    ///         capabilities::Capabilities,
     ///         messages::Message,
     ///         table::get_connection,
     ///     },
     ///     util::dirs::default_db_path,
     /// };
     ///
-    /// let db_path = default_db_path();
+    /// let db_path = default_db_path().unwrap();
     /// let conn = get_connection(&db_path).unwrap();
+    /// let capabilities = Capabilities::determine(&conn).unwrap();
     ///
-    /// if let Ok(mut message) = Message::from_guid("example-guid", &conn) {
-    ///     if let Ok(body) = message.parse_body(&conn) {
-    ///         message.apply_body(body);
-    ///     }
-    ///     println!("{:#?}", message)
+    /// if let Ok(message) = Message::from_guid("example-guid", &conn, &capabilities) {
+    ///     println!("Text: {:?}", message.text);
+    ///     println!("Body components: {:#?}", message.components);
+    ///     println!("Edit history: {:#?}", message.edited_parts);
     /// }
     /// ```
-    pub fn from_guid(guid: &str, db: &Connection) -> Result<Self, TableError> {
-        let mut statement = db
-            .prepare_cached(&ios_16_newer_query(Some("WHERE m.guid = ?1")))
-            .or_else(|_| db.prepare_cached(&ios_14_15_query(Some("WHERE m.guid = ?1"))))
-            .or_else(|_| db.prepare_cached(&ios_13_older_query(Some("WHERE m.guid = ?1"))))?;
+    pub fn from_guid(
+        guid: &str,
+        db: &Connection,
+        capabilities: &Capabilities,
+    ) -> Result<Self, TableError> {
+        let mut statement = prepare_message_query(db, capabilities, Some("WHERE m.guid = ?1"))?;
 
         Message::row(&mut statement, [guid])
     }
@@ -1473,10 +1503,12 @@ impl Message {
             is_read: false,
             item_type: 0,
             other_handle: None,
-            share_status: false,
+            share_status: 0,
             share_direction: None,
             group_title: None,
             group_action_type: 0,
+            message_action_type: 0,
+            error: 0,
             associated_message_guid: None,
             associated_message_type: None,
             balloon_bundle_id: None,
@@ -1489,8 +1521,12 @@ impl Message {
             num_attachments: 0,
             deleted_from: None,
             num_replies: 0,
+            filter_action: None,
+            filter_sub_action: None,
             components: vec![],
             edited_parts: None,
+            is_unattributed: false,
+            conversation_av_mode: None,
         }
     }
 }
@@ -1549,5 +1585,56 @@ mod diagnostic_tests {
         let diagnostic = Message::run_diagnostic(&db).unwrap();
 
         assert_eq!(diagnostic.recoverable_messages, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod shared_location_tests {
+    use crate::tables::messages::{Message, models::SharedLocation};
+
+    fn location(status: i32, direction: Option<i32>) -> Message {
+        let mut message = Message::blank();
+        message.item_type = 4;
+        message.share_status = status;
+        message.share_direction = direction;
+        message
+    }
+
+    #[test]
+    fn maps_status_and_direction_zero_or_one() {
+        for direction in [0, 1] {
+            assert_eq!(
+                location(0, Some(direction)).shared_location_kind(),
+                Some(SharedLocation::Started)
+            );
+            assert_eq!(
+                location(1, Some(direction)).shared_location_kind(),
+                Some(SharedLocation::Stopped)
+            );
+        }
+    }
+
+    #[test]
+    fn maps_null_direction_as_zero() {
+        assert_eq!(
+            location(1, None).shared_location_kind(),
+            Some(SharedLocation::Stopped)
+        );
+    }
+
+    #[test]
+    fn maps_regardless_of_group_action_type() {
+        let mut message = location(1, Some(0));
+        message.group_action_type = 1;
+        assert_eq!(
+            message.shared_location_kind(),
+            Some(SharedLocation::Stopped)
+        );
+    }
+
+    #[test]
+    fn leaves_other_status_or_direction_unmapped() {
+        assert_eq!(location(2, Some(0)).shared_location_kind(), None);
+        assert_eq!(location(0, Some(2)).shared_location_kind(), None);
     }
 }

@@ -13,15 +13,22 @@ use std::{
     io::{BufWriter, IsTerminal, Write, stderr},
 };
 
-use chrono::{DateTime, Datelike, Local, NaiveDate};
+use chrono::{DateTime, Datelike, NaiveDate};
 
 use crate::{
-    app::{error::RuntimeError, export_type::ExportType, progress::ExportProgress, runtime::Config},
+    app::{
+        error::RuntimeError,
+        export_type::ExportType,
+        progress::ExportProgress,
+        runtime::{Config, ORPHANED, UNKNOWN},
+        zone::Zone,
+    },
+    exporters::shared::announcement::{YOU, resolve_announcement},
 };
 
 use imessage_database::{
     error::table::TableError,
-    message_types::variants::{Announcement, Tapback, TapbackAction, Variant},
+    message_types::variants::{Announcement, KeptMessage, Tapback, TapbackAction, Variant},
     tables::{
         attachment::Attachment,
         chat::Chat,
@@ -29,7 +36,6 @@ use imessage_database::{
             Message,
             models::{AttributedRange, BubbleComponent, GroupAction},
         },
-        table::{ME, ORPHANED, Table, UNKNOWN, YOU},
     },
 };
 
@@ -117,27 +123,27 @@ impl<'a> Timeline<'a> {
         let mut current_message = 0;
         let total_messages = Message::get_count(
             self.config.data_source.db(),
+            &self.config.data_source.capabilities,
             &self.config.options.query_context,
         )?;
         self.pb.start(total_messages);
 
         let mut statement = Message::stream_rows(
             self.config.data_source.db(),
+            &self.config.data_source.capabilities,
             &self.config.options.query_context,
         )?;
 
+        // Message bodies (text and components) are parsed while each row is
+        // read, so there is no separate body-parsing step here.
         for message in Message::rows(&mut statement, [])? {
-            let mut msg = message?;
+            let msg = message?;
 
             if msg.rowid == current_message_row {
                 current_message += 1;
                 continue;
             }
             current_message_row = msg.rowid;
-
-            if let Ok(body) = msg.parse_body(self.config.data_source.db()) {
-                msg.apply_body(body);
-            }
 
             if msg.is_announcement() {
                 let block = self.format_announcement(&msg);
@@ -169,8 +175,8 @@ impl<'a> Timeline<'a> {
         // If the date can't be parsed, skip the message rather than failing
         // the whole export. This mirrors the existing exporters' tolerance
         // for bad date data.
-        let local = match msg.date(self.config.offset) {
-            Ok(d) => d,
+        let local = match msg.date() {
+            Ok(d) => d.with_timezone(&self.config.options.timezone),
             Err(_) => return Ok(()),
         };
         let day = local.date_naive();
@@ -260,8 +266,8 @@ impl<'a> Timeline<'a> {
     /// Returns a placeholder string on date parse error so we never lose
     /// the message entirely.
     fn format_time_of_day(&self, msg: &Message) -> String {
-        match msg.date(self.config.offset) {
-            Ok(d) => format_time(&d),
+        match msg.date() {
+            Ok(d) => format_time(&d.with_timezone(&self.config.options.timezone)),
             Err(_) => "(unknown time)".to_string(),
         }
     }
@@ -294,7 +300,11 @@ impl<'a> Timeline<'a> {
             out.push('\n');
         }
 
-        let attachments = Attachment::from_message(self.config.data_source.db(), msg)?;
+        let attachments = Attachment::from_message(
+            self.config.data_source.db(),
+            msg,
+            &self.config.data_source.capabilities,
+        )?;
         let mut attachment_index: usize = 0;
         let mut wrote_body = false;
 
@@ -394,15 +404,15 @@ impl<'a> Timeline<'a> {
         }
 
         // Replies: render each as a blockquote so the threading is visible.
-        let mut replies = msg.get_replies(self.config.data_source.db())?;
+        let replies = msg.get_replies(
+            self.config.data_source.db(),
+            &self.config.data_source.capabilities,
+        )?;
         let mut reply_keys: Vec<usize> = replies.keys().copied().collect();
         reply_keys.sort_unstable();
         for k in reply_keys {
-            if let Some(reply_set) = replies.get_mut(&k) {
+            if let Some(reply_set) = replies.get(&k) {
                 for reply in reply_set {
-                    if let Ok(body) = reply.parse_body(self.config.data_source.db()) {
-                        reply.apply_body(body);
-                    }
                     if reply.is_tapback() || reply.is_poll_vote() || reply.is_poll_update() {
                         continue;
                     }
@@ -439,64 +449,128 @@ impl<'a> Timeline<'a> {
     /// Build the Markdown block for an announcement (e.g. group rename, kept
     /// audio message). Rendered as a single italic line so it's visually
     /// distinct from regular messages.
+    ///
+    /// The actor and the added or removed participant come from upstream's
+    /// shared `resolve_announcement`, so the timeline names the same person
+    /// the TXT and HTML exports name. That includes events Messages shows
+    /// with no actor (unattributed group events, unknown event rows, locations
+    /// sent to emergency services), which get a sentence without a subject.
     fn format_announcement(&self, msg: &Message) -> String {
-        let mut who = self
-            .config
-            .who(msg.handle_id, msg.is_from_me(), &msg.destination_caller_id);
-        if who == ME {
-            who = self.config.options.custom_name.as_deref().unwrap_or(YOU);
-        }
-
         let time = self.format_time_of_day(msg);
 
-        let action_text = match msg.get_announcement() {
-            Some(announcement) => match announcement {
+        let Some(resolved) = resolve_announcement(msg, self.config, YOU) else {
+            return format!("*{time} — (unable to format announcement)*\n\n");
+        };
+        let participant = resolved.participant_name;
+
+        let sentence = match resolved.who {
+            Some(who) => {
+                let action_text = match &resolved.announcement {
+                    Announcement::GroupAction(action) => match action {
+                        GroupAction::ParticipantAdded(_) => {
+                            format!("added {participant} to the conversation.")
+                        }
+                        GroupAction::ParticipantRemoved(_) => {
+                            format!("removed {participant} from the conversation.")
+                        }
+                        GroupAction::NameChange(name) => {
+                            format!("renamed the conversation to {name}.")
+                        }
+                        GroupAction::NameRemoved => {
+                            "removed the name from the conversation.".to_string()
+                        }
+                        GroupAction::ParticipantLeft => "left the conversation.".to_string(),
+                        GroupAction::GroupIconChanged | GroupAction::GroupIconChangedHidden => {
+                            "changed the group photo.".to_string()
+                        }
+                        GroupAction::GroupIconRemoved => "removed the group photo.".to_string(),
+                        GroupAction::ChatBackgroundChanged
+                        | GroupAction::ChatBackgroundChangedHidden => {
+                            "changed the chat background.".to_string()
+                        }
+                        GroupAction::ChatBackgroundSensitive => {
+                            "set a chat background which may be sensitive.".to_string()
+                        }
+                        GroupAction::ChatBackgroundRemoved => {
+                            "removed the chat background.".to_string()
+                        }
+                        GroupAction::PhoneNumberChanged(_) => {
+                            "changed their phone number.".to_string()
+                        }
+                    },
+                    Announcement::MessageKept(KeptMessage::Audio) => {
+                        "kept an audio message.".to_string()
+                    }
+                    Announcement::MessageKept(KeptMessage::Video) => {
+                        "kept a video message.".to_string()
+                    }
+                    Announcement::MessageKept(KeptMessage::App | KeptMessage::Unknown(_)) => {
+                        "kept a message.".to_string()
+                    }
+                    Announcement::FullyUnsent => "unsent a message!".to_string(),
+                    Announcement::TranscriptSharingStopped => {
+                        "stopped sharing the Emergency SOS transcript of this conversation."
+                            .to_string()
+                    }
+                    // `resolve_announcement` never gives these an actor.
+                    Announcement::EmergencyLocationSent | Announcement::UnknownEvent(_) => {
+                        "(unable to format announcement)".to_string()
+                    }
+                };
+                format!("{who} {action_text}")
+            }
+            None => match &resolved.announcement {
                 Announcement::GroupAction(action) => match action {
-                    GroupAction::ParticipantAdded(person)
-                    | GroupAction::ParticipantRemoved(person) => {
-                        let resolved =
-                            self.config
-                                .who(Some(person), false, &msg.destination_caller_id);
-                        let (verb, prep) =
-                            if matches!(action, GroupAction::ParticipantAdded(_)) {
-                                ("added", "to")
-                            } else {
-                                ("removed", "from")
-                            };
-                        format!("{verb} {resolved} {prep} the conversation.")
+                    GroupAction::ParticipantAdded(_) => {
+                        format!("{participant} was added to the conversation.")
+                    }
+                    GroupAction::ParticipantRemoved(_) => {
+                        format!("{participant} was removed from the conversation.")
                     }
                     GroupAction::NameChange(name) => {
-                        format!("renamed the conversation to {name}.")
+                        format!("The conversation was renamed to {name}.")
                     }
-                    GroupAction::ParticipantLeft => "left the conversation.".to_string(),
-                    GroupAction::GroupIconChanged => "changed the group photo.".to_string(),
-                    GroupAction::GroupIconRemoved => "removed the group photo.".to_string(),
-                    GroupAction::ChatBackgroundChanged => {
-                        "changed the chat background.".to_string()
+                    GroupAction::NameRemoved => "The conversation name was removed.".to_string(),
+                    GroupAction::GroupIconChanged | GroupAction::GroupIconChangedHidden => {
+                        "The group photo was changed.".to_string()
+                    }
+                    GroupAction::GroupIconRemoved => "The group photo was removed.".to_string(),
+                    GroupAction::ChatBackgroundChanged
+                    | GroupAction::ChatBackgroundChangedHidden => {
+                        "The chat background was changed.".to_string()
+                    }
+                    GroupAction::ChatBackgroundSensitive => {
+                        "A chat background was set which may be sensitive.".to_string()
                     }
                     GroupAction::ChatBackgroundRemoved => {
-                        "removed the chat background.".to_string()
+                        "The chat background was removed.".to_string()
                     }
-                    GroupAction::PhoneNumberChanged(_) => {
-                        "changed their phone number.".to_string()
+                    // `resolve_announcement` always gives these an actor.
+                    GroupAction::ParticipantLeft | GroupAction::PhoneNumberChanged(_) => {
+                        "(unable to format announcement)".to_string()
                     }
                 },
-                Announcement::AudioMessageKept => "kept an audio message.".to_string(),
-                Announcement::FullyUnsent => "unsent a message!".to_string(),
-                Announcement::Unknown(num) => format!("performed unknown action {num}."),
+                Announcement::EmergencyLocationSent => {
+                    "Location sent to emergency services.".to_string()
+                }
+                Announcement::UnknownEvent(event) => format!("Unknown event ({event:?})."),
+                Announcement::MessageKept(_)
+                | Announcement::FullyUnsent
+                | Announcement::TranscriptSharingStopped => {
+                    "(unable to format announcement)".to_string()
+                }
             },
-            None => "(unable to format announcement)".to_string(),
         };
 
-        format!("*{time} — {who} {action_text}*\n\n")
+        format!("*{time} — {sentence}*\n\n")
     }
 }
 
 // MARK: Free helpers
-/// Format a `DateTime<Local>` as "5:29:42 PM". Uses `%-l` (unpadded
-/// 12-hour) so we don't need to trim a leading space the way the
+/// Format a `DateTime` in the export's timezone as "5:29:42 PM". Uses `%-l`
+/// (unpadded 12-hour) so we don't need to trim a leading space the way the
 /// `imessage_database::util::dates::format` helper would.
-pub(crate) fn format_time(date: &DateTime<Local>) -> String {
+pub(crate) fn format_time(date: &DateTime<Zone>) -> String {
     date.format("%-l:%M:%S %p").to_string()
 }
 
@@ -630,6 +704,9 @@ mod tests {
             chat_identifier: "Default".to_string(),
             service_name: Some(String::new()),
             display_name: None,
+            is_filtered: None,
+            is_blackholed: None,
+            is_pending_review: None,
         }
     }
 
@@ -700,15 +777,11 @@ mod tests {
         let config = Config::fake_app(isolated_options("format_timeline_message_basic_from_me"));
         let exporter = Timeline::new(&config).unwrap();
 
-        let mut message = Config::fake_message();
+        let mut message = Config::fake_message_with_text("Hello world");
         // May 17, 2022 8:29:42 PM UTC -> 5:29:42 PM PT
         message.date = 674526582885055488;
-        message.text = Some("Hello world".to_string());
         message.is_from_me = true;
         message.chat_id = Some(0);
-        message
-            .generate_text_legacy(config.data_source.db())
-            .unwrap();
 
         let actual = exporter.format_timeline_message(&message).unwrap();
         let expected = "**5:29:42 PM — Me**\n\nHello world\n\n";
@@ -725,13 +798,9 @@ mod tests {
         config.real_participants.insert(999_999, 999_999);
         let exporter = Timeline::new(&config).unwrap();
 
-        let mut message = Config::fake_message();
+        let mut message = Config::fake_message_with_text("Hello world");
         message.date = 674526582885055488;
-        message.text = Some("Hello world".to_string());
         message.handle_id = Some(999_999);
-        message
-            .generate_text_legacy(config.data_source.db())
-            .unwrap();
 
         let actual = exporter.format_timeline_message(&message).unwrap();
         let expected = "**5:29:42 PM — Sample Contact**\n\nHello world\n\n";

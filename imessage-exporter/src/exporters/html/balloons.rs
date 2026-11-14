@@ -1,11 +1,18 @@
 use imessage_database::{
     message_types::{
-        app::AppMessage, app_store::AppStoreMessage, collaboration::CollaborationMessage,
-        digital_touch::DigitalTouch, handwriting::HandwrittenMessage, music::MusicMessage,
-        placemark::PlacemarkMessage, polls::Poll, url::URLMessage,
+        app::AppMessage,
+        app_store::AppStoreMessage,
+        business_chat::BusinessMessage,
+        collaboration::CollaborationMessage,
+        digital_touch::{DigitalTouchMessage, ImageBackdrop, media::MediaKind},
+        handwriting::HandwrittenMessage,
+        music::MusicMessage,
+        placemark::PlacemarkMessage,
+        polls::Poll,
+        url::URLMessage,
     },
     tables::{
-        attachment::Attachment,
+        attachment::{Attachment, MediaType},
         messages::{Message, models::AttachmentMeta},
     },
 };
@@ -16,12 +23,33 @@ use crate::exporters::{
         HTML,
         safe::Html,
         view_model::{
-            AppCardVM, AppStoreVM, ApplePayVM, CheckInVM, CollaborationVM, DigitalTouchVM,
-            FindMyVM, MusicVM, PlacemarkVM, PollOptionVM, PollVM, UrlVM,
+            AppCardVM, AppStoreVM, ApplePayVM, AttachmentVM, AttachmentVariant, CheckInVM,
+            CollaborationVM, FindMyVM, FormAnswerVM, FormRequestVM, FormResponseVM,
+            ListPickerItemVM, ListPickerVM, MusicVM, PlacemarkVM, PollOptionVM, PollVM,
+            QuickReplyOptionVM, QuickReplyVM, UrlVM,
         },
     },
-    shared::{balloon::resolve_check_in_footer, render::render_template},
+    shared::{
+        attachment::{ExportFile, prepare_attachment},
+        balloon::resolve_check_in_footer,
+        driver::ExportState,
+        render::render_template,
+    },
 };
+
+use crate::app::runtime::Config;
+
+/// Prepare the attachment backing a Digital Touch media message and confirm its
+/// presence on disk. On `None`, render the labeled black canvas.
+fn digital_touch_file<'a>(
+    config: &Config,
+    state: &ExportState,
+    attachment: &'a Attachment,
+    msg: &Message,
+) -> Option<ExportFile<'a>> {
+    let file = prepare_attachment(config, state, attachment, msg).ok()?;
+    file.path.exists().then_some(file)
+}
 
 // MARK: Balloons
 impl BalloonFormatter for HTML<'_> {
@@ -74,14 +102,9 @@ impl BalloonFormatter for HTML<'_> {
             url: balloon.get_url().into(),
             name: balloon.placemark.name.into(),
             address: balloon.placemark.address.into(),
-            state: balloon.placemark.state.into(),
-            city: balloon.placemark.city.into(),
-            iso_country_code: balloon.placemark.iso_country_code.into(),
             postal_code: balloon.placemark.postal_code.into(),
             country: balloon.placemark.country.into(),
-            street: balloon.placemark.street.into(),
             sub_administrative_area: balloon.placemark.sub_administrative_area.into(),
-            sub_locality: balloon.placemark.sub_locality.into(),
         })
     }
 
@@ -89,10 +112,14 @@ impl BalloonFormatter for HTML<'_> {
         balloon.render_svg()
     }
 
-    fn format_digital_touch(&self, _: &Message, balloon: &DigitalTouch) -> String {
-        render_template(&DigitalTouchVM {
-            debug: format!("{balloon:?}"),
-        })
+    fn format_digital_touch(&self, msg: &Message, balloon: &DigitalTouchMessage) -> String {
+        // Wrap in `.digital_touch` (inside the standard `app` card) as the CSS
+        // hook that caps the bubble to the card's width; the opaque content then
+        // fills that bubble, covering the `app` card's white background.
+        format!(
+            r#"<div class="digital_touch">{}</div>"#,
+            self.digital_touch_body(msg, balloon)
+        )
     }
 
     fn format_apple_pay(&self, balloon: &AppMessage) -> String {
@@ -121,7 +148,7 @@ impl BalloonFormatter for HTML<'_> {
         render_template(&CheckInVM {
             name: balloon.app_name.unwrap_or("Check In"),
             ldtext: balloon.ldtext.into(),
-            footer: resolve_check_in_footer(balloon),
+            footer: resolve_check_in_footer(balloon, &self.config.options.timezone),
         })
     }
 
@@ -155,15 +182,68 @@ impl BalloonFormatter for HTML<'_> {
         render_template(&PollVM { options })
     }
 
+    fn format_business(&self, balloon: &BusinessMessage) -> String {
+        match balloon {
+            BusinessMessage::QuickReply(quick_reply) => {
+                let options = quick_reply
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, option)| QuickReplyOptionVM {
+                        text: &option.title,
+                        selected: quick_reply.selected_index == Some(index),
+                    })
+                    .collect();
+                render_template(&QuickReplyVM {
+                    summary: quick_reply.summary.as_deref().into(),
+                    options,
+                })
+            }
+            BusinessMessage::FormResponse(form) => {
+                let answers = form
+                    .answers
+                    .iter()
+                    .map(|answer| FormAnswerVM {
+                        question: &answer.question,
+                        answer: answer.answers.join(", "),
+                    })
+                    .collect();
+                render_template(&FormResponseVM {
+                    summary: form.summary.as_deref().into(),
+                    answers,
+                })
+            }
+            BusinessMessage::FormRequest(form) => render_template(&FormRequestVM {
+                title: form.title.as_deref().into(),
+                subtitle: form.subtitle.as_deref().into(),
+            }),
+            BusinessMessage::ListPicker(list_picker) => {
+                let items = list_picker
+                    .items
+                    .iter()
+                    .map(|item| ListPickerItemVM {
+                        title: &item.title,
+                        subtitle: item.subtitle.as_deref().into(),
+                        selected: item.selected,
+                    })
+                    .collect();
+                render_template(&ListPickerVM {
+                    summary: list_picker.summary.as_deref().into(),
+                    items,
+                })
+            }
+        }
+    }
+
     fn format_generic_app(
         &self,
         balloon: &AppMessage,
         bundle_id: &str,
-        attachments: &mut Vec<Attachment>,
+        attachments: &[Attachment],
         msg: &Message,
     ) -> String {
         let attachment_html = if balloon.image.is_none() {
-            attachments.get_mut(0).map(|attachment| {
+            attachments.first().map(|attachment| {
                 let rendered =
                     match self.format_attachment(attachment, msg, &AttachmentMeta::default()) {
                         AttachmentRender::Embedded(html) => html,
@@ -181,6 +261,46 @@ impl BalloonFormatter for HTML<'_> {
 }
 
 impl HTML<'_> {
+    /// Render the inner markup for a Digital Touch message, dispatching on the
+    /// parsed [`MediaKind`]: a video plays as a standalone `<video>` (it never has
+    /// an overlay, and an in-SVG `<foreignObject>` video overflows the bubble on
+    /// play), while an image backs the SVG its overlay draws over. Anything with
+    /// no usable backing attachment falls back to the labeled black canvas.
+    fn digital_touch_body(&self, msg: &Message, balloon: &DigitalTouchMessage) -> String {
+        let DigitalTouchMessage::Media(media) = balloon else {
+            return balloon.render_svg(None);
+        };
+        // The media is a normal attachment on the message row.
+        let Some(attachment) = Attachment::from_message(
+            self.config.data_source.db(),
+            msg,
+            &self.config.data_source.capabilities,
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next()) else {
+            return balloon.render_svg(None);
+        };
+        let Some(file) = digital_touch_file(self.config, &self.state, &attachment, msg) else {
+            return balloon.render_svg(None);
+        };
+        let embed_path = self.config.relative_path(&file.path);
+
+        // Dispatch on the parsed kind, but require the resolved file to match
+        match (&media.kind, &file.media_type) {
+            // Reuse the shared attachment `<video>` template so the player gets the
+            // correct `type` hint and the duplicated source tag (see issue #73).
+            (MediaKind::Video, MediaType::Video(media_type)) => render_template(&AttachmentVM {
+                lazy: !self.config.options.no_lazy,
+                embed_path,
+                variant: AttachmentVariant::Video { media_type },
+            }),
+            (MediaKind::Image { .. }, MediaType::Image(_)) => {
+                balloon.render_svg(Some(ImageBackdrop(embed_path.into())))
+            }
+            _ => balloon.render_svg(None),
+        }
+    }
+
     fn balloon_to_html(
         &self,
         balloon: &AppMessage,

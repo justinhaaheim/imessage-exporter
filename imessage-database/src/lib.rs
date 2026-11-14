@@ -5,4 +5,12 @@
 pub mod error;
 pub mod message_types;
 pub mod tables;
+#[cfg(test)]
+mod test_support;
 pub mod util;
+
+// Re-export commonly used crates for convenience
+pub use chrono;
+pub use crabstep;
+pub use plist;
+pub use rusqlite;

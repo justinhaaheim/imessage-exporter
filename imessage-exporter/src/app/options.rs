@@ -2,14 +2,17 @@
  CLI option parsing and validation.
 */
 
-use std::path::PathBuf;
+use std::{env::home_dir, path::PathBuf};
 
 use clap::{Arg, ArgAction, ArgMatches, Command, crate_version};
 
 use imessage_database::{
-    tables::{attachment::DEFAULT_MESSAGES_ROOT, table::DEFAULT_PATH_IOS},
+    tables::{
+        attachment::DEFAULT_MESSAGES_ROOT,
+        table::{DEFAULT_PATH_IOS, DEFAULT_PATH_MACOS},
+    },
     util::{
-        dirs::{default_db_path, home},
+        dirs::{default_db_path, expand_home},
         platform::Platform,
         query_context::QueryContext,
     },
@@ -19,6 +22,7 @@ use crate::app::{
     compatibility::attachment_manager::{AttachmentManager, AttachmentManagerMode},
     error::RuntimeError,
     export_type::ExportType,
+    zone::Zone,
 };
 
 // MARK: Constants
@@ -44,6 +48,7 @@ pub const OPTION_CONVERSATION_WITH: &str = "conversation-with";
 pub const OPTION_CLEARTEXT_PASSWORD: &str = "cleartext-password";
 pub const OPTION_CUSTOM_CONTACTS_DB_PATH: &str = "contacts-path";
 pub const OPTION_NO_PROGRESS: &str = "no-progress";
+pub const OPTION_USE_MESSAGE_TIMES: &str = "use-message-times";
 
 // Other CLI Text
 pub const SUPPORTED_FILE_TYPES: &str = "txt, html, timeline";
@@ -72,6 +77,8 @@ pub struct Options {
     pub export_path: PathBuf,
     /// SQL query filters.
     pub query_context: QueryContext,
+    /// Timezone for rendering timestamps and setting date-filter bounds.
+    pub timezone: Zone,
     /// Whether to omit `loading="lazy"` in HTML exports.
     pub no_lazy: bool,
     /// Custom name for the database owner in output.
@@ -97,6 +104,8 @@ pub struct Options {
     pub contacts_path: Option<PathBuf>,
     /// Whether to show the export progress bar when the terminal supports it.
     pub show_progress: bool,
+    /// Whether to stamp transcript and attachment files with message dates.
+    pub use_message_times: bool,
 }
 
 // Redact the cleartext backup password from debug output.
@@ -110,12 +119,14 @@ impl std::fmt::Debug for Options {
             .field("export_type", &self.export_type)
             .field("export_path", &self.export_path)
             .field("query_context", &self.query_context)
+            .field("timezone", &self.timezone)
             .field("no_lazy", &self.no_lazy)
             .field("custom_name", &self.custom_name)
             .field("use_caller_id", &self.use_caller_id)
             .field("platform", &self.platform)
             .field("ignore_disk_space", &self.ignore_disk_space)
             .field("conversation_filter", &self.conversation_filter)
+            .field("conversation_with", &self.conversation_with)
             // Don't print the actual password if it's set
             .field(
                 "cleartext_password",
@@ -123,6 +134,7 @@ impl std::fmt::Debug for Options {
             )
             .field("contacts_path", &self.contacts_path)
             .field("show_progress", &self.show_progress)
+            .field("use_message_times", &self.use_message_times)
             .finish()
     }
 }
@@ -151,6 +163,7 @@ impl Options {
         let cleartext_password: Option<&String> = args.get_one(OPTION_CLEARTEXT_PASSWORD);
         let contacts_path: Option<&String> = args.get_one(OPTION_CUSTOM_CONTACTS_DB_PATH);
         let show_progress = !args.get_flag(OPTION_NO_PROGRESS);
+        let use_message_times = args.get_flag(OPTION_USE_MESSAGE_TIMES);
 
         // Build the export type
         let export_type: Option<ExportType> = match export_file_type {
@@ -175,6 +188,7 @@ impl Options {
                 (conversation_filter.is_some(), OPTION_CONVERSATION_FILTER),
                 (!conversation_with.is_empty(), OPTION_CONVERSATION_WITH),
                 (!show_progress, OPTION_NO_PROGRESS),
+                (use_message_times, OPTION_USE_MESSAGE_TIMES),
             ];
             for (set, opt) in format_deps {
                 if set {
@@ -183,6 +197,13 @@ impl Options {
                     )));
                 }
             }
+        }
+
+        // Absent both of these, there is no work to do: bail before any data source is opened
+        if !diagnostic && export_type.is_none() {
+            return Err(RuntimeError::InvalidOptions(format!(
+                "Neither --{OPTION_EXPORT_TYPE} nor --{OPTION_DIAGNOSTIC} was set; nothing to do! Use --help to see usage."
+            )));
         }
 
         // During `diagnostics`, none of these may be set
@@ -198,6 +219,7 @@ impl Options {
             (conversation_filter.is_some(), OPTION_CONVERSATION_FILTER),
             (!conversation_with.is_empty(), OPTION_CONVERSATION_WITH),
             (!show_progress, OPTION_NO_PROGRESS),
+            (use_message_times, OPTION_USE_MESSAGE_TIMES),
         ];
         for (set, opt) in diag_conflicts {
             if diagnostic && set {
@@ -214,15 +236,19 @@ impl Options {
             )));
         }
 
+        // Choose the zone before setting date filters to use midnight in the
+        // same zone for filtering and rendering.
+        let timezone = Zone::Local;
+
         // Build query context
         let mut query_context = QueryContext::default();
         if let Some(start) = start_date
-            && let Err(why) = query_context.set_start(start)
+            && let Err(why) = query_context.set_start(start, &timezone)
         {
             return Err(RuntimeError::InvalidOptions(format!("{why}")));
         }
         if let Some(end) = end_date
-            && let Err(why) = query_context.set_end(end)
+            && let Err(why) = query_context.set_end(end, &timezone)
         {
             return Err(RuntimeError::InvalidOptions(format!("{why}")));
         }
@@ -230,16 +256,36 @@ impl Options {
         // We have to allocate a PathBuf here because it can be created from data owned by this function in the default state
         let db_path = match user_path {
             Some(path) => PathBuf::from(path),
-            None => default_db_path(),
+            None => default_db_path().ok_or_else(|| {
+                RuntimeError::InvalidOptions(format!(
+                    "Unable to determine the home directory; specify the database location with --{OPTION_DB_PATH}"
+                ))
+            })?,
         };
 
         // Build the Platform
         let platform = match platform_type {
             Some(platform_str) => {
-                Platform::from_cli(platform_str).ok_or(RuntimeError::InvalidOptions(format!(
-                    "{platform_str} is not a valid platform! Must be one of <{SUPPORTED_PLATFORMS}>"
-                )))?
+                let platform =
+                    Platform::from_cli(platform_str).ok_or(RuntimeError::InvalidOptions(format!(
+                        "{platform_str} is not a valid platform! Must be one of <{SUPPORTED_PLATFORMS}>"
+                    )))?;
+                // For an explicit iOS platform, validate the backup root before reading its
+                // manifest so we can report path hints instead of a manifest read error.
+                if platform == Platform::iOS
+                    && user_path.is_some()
+                    && Platform::determine(&db_path)? == Platform::macOS
+                {
+                    return Err(RuntimeError::InvalidOptions(format!(
+                        "--{OPTION_PLATFORM} is {platform}, but `{}` is a file, not a backup directory",
+                        db_path.display()
+                    )));
+                }
+                platform
             }
+            // Defer validation of the default macOS database path to connection setup to avoid
+            // repeating the filesystem checks and path diagnostics.
+            None if user_path.is_none() => Platform::macOS,
             None => Platform::determine(&db_path)?,
         };
 
@@ -278,14 +324,6 @@ impl Options {
             }
         }
 
-        // Custom contacts paths do not affect encrypted iOS backup extraction.
-        if contacts_path.is_some() && platform == Platform::iOS {
-            eprintln!(
-                "Option --{OPTION_CUSTOM_CONTACTS_DB_PATH} is enabled, but the platform is {}, so the path will have no effect!",
-                Platform::iOS
-            );
-        }
-
         // Determine the attachment manager mode
         let attachment_manager_mode = match attachment_manager_type {
             Some(manager) => {
@@ -307,6 +345,7 @@ impl Options {
             export_type,
             export_path,
             query_context,
+            timezone,
             no_lazy,
             custom_name: custom_name.cloned(),
             use_caller_id,
@@ -317,6 +356,7 @@ impl Options {
             cleartext_password: cleartext_password.cloned(),
             contacts_path: contacts_path.cloned().map(PathBuf::from),
             show_progress,
+            use_message_times,
         })
     }
 
@@ -329,6 +369,14 @@ impl Options {
     }
 }
 
+/// Return the default export directory: `imessage_export` under the home directory.
+///
+/// Falls back to `imessage_export` under the current directory when the home directory is unknown:
+/// `home_dir()` yields `None` only when neither `HOME`/`USERPROFILE` nor the OS user record names one.
+fn default_export_path() -> PathBuf {
+    home_dir().unwrap_or_default().join(DEFAULT_OUTPUT_DIR)
+}
+
 /// Resolve and validate the export directory.
 ///
 /// When an export type is selected, the directory must not already contain
@@ -338,8 +386,7 @@ fn validate_path(
     export_type: Option<&ExportType>,
 ) -> Result<PathBuf, RuntimeError> {
     // Build a path from the user-provided data or the default location
-    let resolved_path =
-        PathBuf::from(export_path.unwrap_or(&format!("{}/{DEFAULT_OUTPUT_DIR}", home())));
+    let resolved_path = export_path.map_or_else(default_export_path, PathBuf::from);
 
     // If there is an export type selected, ensure we do not overwrite files of the same type
     if let Some(export_type) = export_type
@@ -415,7 +462,7 @@ fn get_command() -> Command {
             Arg::new(OPTION_DB_PATH)
                 .short('p')
                 .long(OPTION_DB_PATH)
-                .help(format!("Specify an optional custom path for the iMessage database location\nFor macOS, specify a path to a `chat.db` file\nFor iOS, specify a path to the root of a device backup directory\nIf the iOS backup is encrypted, --{OPTION_CLEARTEXT_PASSWORD} can be passed or you will be prompted for the password\nIf omitted, the default directory is {}\n", default_db_path().display()))
+                .help(format!("Specify an optional custom path for the iMessage database location\nFor macOS, specify a path to a `chat.db` file\nFor iOS, specify a path to the root of a device backup directory\nIf the iOS backup is encrypted, --{OPTION_CLEARTEXT_PASSWORD} can be passed or you will be prompted for the password\nIf omitted, the default directory is {}\n", default_db_path().map_or_else(|| format!("~/{DEFAULT_PATH_MACOS}"), |path| path.display().to_string())))
                 .display_order(3)
                 .value_name("path/to/source"),
         )
@@ -423,7 +470,7 @@ fn get_command() -> Command {
             Arg::new(OPTION_ATTACHMENT_ROOT)
                 .short('r')
                 .long(OPTION_ATTACHMENT_ROOT)
-                .help(format!("Specify an optional custom path to look for attachment data in\nOnly use this if attachments are stored separately from the database's default location\nThe provided path should be absolute\nThis option affects both the `Attachments` and `StickerCache` directories\nAlso works with jailbroken iOS sms.db databases (use `--platform macOS`)\nHas no effect on iOS backups\nThe default location is {}\n", DEFAULT_MESSAGES_ROOT.replacen('~', &home(), 1)))
+                .help(format!("Specify an optional custom path to look for attachment data in\nOnly use this if attachments are stored separately from the database's default location\nThe provided path should be absolute\nThis option affects both the `Attachments` and `StickerCache` directories\nAlso works with jailbroken iOS sms.db databases (use `--platform macOS`)\nHas no effect on iOS backups\nThe default location is {}\n", expand_home(DEFAULT_MESSAGES_ROOT)))
                 .display_order(4)
                 .value_name("path/to/messages/root"),
         )
@@ -439,7 +486,7 @@ fn get_command() -> Command {
             Arg::new(OPTION_EXPORT_PATH)
                 .short('o')
                 .long(OPTION_EXPORT_PATH)
-                .help(format!("Specify an optional custom directory for outputting exported data\nIf omitted, the default directory is {}/{DEFAULT_OUTPUT_DIR}\n", home()))
+                .help(format!("Specify an optional custom directory for outputting exported data\nIf omitted, the default directory is {}\n", default_export_path().display()))
                 .display_order(6)
                 .value_name("path/to/save/files"),
         )
@@ -519,8 +566,8 @@ fn get_command() -> Command {
             Arg::new(OPTION_CUSTOM_CONTACTS_DB_PATH)
                 .short('n')
                 .long(OPTION_CUSTOM_CONTACTS_DB_PATH)
-                .help("Optional custom path for a macOS or iOS contacts database file\nThis should be resolved automatically, but can be manually provided\nHandles from the messages table will be mapped to names in the provided database\nGenerally, one of `AddressBook-v22.abcddb` or `AddressBook.sqlitedb`\n")
-                .display_order(16)
+                .help("Optional custom path for a macOS or iOS contacts database file\nThis should be resolved automatically, but can be manually provided\nHandles from the messages table will be mapped to names in the provided database\nGenerally, one of `AddressBook-v22.abcddb` or `AddressBook.sqlitedb`\nFor an iOS backup, pass this option to use a custom Contacts database instead of the copy in the backup\n")
+                .display_order(15)
                 .value_name("path"),
         )
         .arg(
@@ -530,11 +577,20 @@ fn get_command() -> Command {
                 .action(ArgAction::SetTrue)
                 .display_order(16),
         )
+        .arg(
+            Arg::new(OPTION_USE_MESSAGE_TIMES)
+                .long(OPTION_USE_MESSAGE_TIMES)
+                .help("Stamp transcripts with the earliest and latest message dates in this export\nAlso set each new attachment file's creation time to its message date\nCreation time is set only on macOS and Windows\n")
+                .action(ArgAction::SetTrue)
+                .display_order(17),
+        )
 }
 
 #[cfg(test)]
 impl Options {
     pub fn fake_options(export_type: ExportType) -> Options {
+        use imessage_database::chrono::FixedOffset;
+
         use crate::app::test_dir::unique_test_dir;
 
         Options {
@@ -549,6 +605,9 @@ impl Options {
             export_type: Some(export_type),
             export_path: unique_test_dir("fake-options"),
             query_context: QueryContext::default(),
+            // Use fixed -07:00 to match Pacific daylight time for fixture stamps
+            // without depending on the host zone or daylight-saving rules.
+            timezone: Zone::Fixed(FixedOffset::west_opt(7 * 3600).unwrap()),
             no_lazy: false,
             custom_name: None,
             use_caller_id: false,
@@ -558,7 +617,10 @@ impl Options {
             conversation_with: Vec::new(),
             cleartext_password: None,
             contacts_path: None,
-            show_progress: true,
+            // The harness leaves stderr as a TTY, so a true default draws `\r`
+            // bars over test output.
+            show_progress: false,
+            use_message_times: false,
         }
     }
 }
@@ -579,6 +641,7 @@ mod arg_tests {
         export_type::ExportType,
         options::{Options, get_command, validate_path},
         test_dir::unique_test_dir,
+        zone::Zone,
     };
 
     #[test]
@@ -591,13 +654,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: true,
             export_type: None,
             export_path: validate_path(None, None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: false,
             custom_name: None,
             use_caller_id: false,
@@ -608,6 +672,7 @@ mod arg_tests {
             cleartext_password: None,
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -668,13 +733,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: false,
             export_type: Some(ExportType::Html),
             export_path: validate_path(Some(&dir_str), None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: false,
             custom_name: None,
             use_caller_id: false,
@@ -685,6 +751,7 @@ mod arg_tests {
             cleartext_password: None,
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -700,13 +767,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: false,
             export_type: Some(ExportType::Txt),
             export_path: validate_path(None, None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: true,
             custom_name: None,
             use_caller_id: false,
@@ -717,6 +785,7 @@ mod arg_tests {
             cleartext_password: None,
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -761,8 +830,40 @@ mod arg_tests {
     #[test]
     fn cant_build_option_invalid_platform() {
         let command = get_command();
-        let args = command.get_matches_from(["imessage-exporter", "-a", "iPad"]);
+        let args = command.get_matches_from(["imessage-exporter", "-a", "iPad", "-f", "txt"]);
         assert!(Options::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn cant_build_option_ios_platform_with_file_path() {
+        let dir = crate::app::test_dir::unique_test_dir("ios-file-path");
+        let file = dir.join("chat.db");
+        std::fs::File::create(&file).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let command = get_command();
+        let args =
+            command.get_matches_from(["imessage-exporter", "-a", "ios", "-f", "txt", "-p", &path]);
+
+        let error = Options::from_args(&args).unwrap_err().to_string();
+
+        assert!(
+            error.contains("is a file, not a backup directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cant_build_option_ios_platform_with_directory_lacking_messages_database() {
+        let dir = crate::app::test_dir::unique_test_dir("ios-empty-dir");
+        let path = dir.to_string_lossy().into_owned();
+        let command = get_command();
+        let args =
+            command.get_matches_from(["imessage-exporter", "-a", "ios", "-f", "txt", "-p", &path]);
+
+        let error = Options::from_args(&args).unwrap_err().to_string();
+
+        assert!(error.contains("contains no Messages database"), "{error}");
+        assert!(!error.contains("not a database file"), "{error}");
     }
 
     #[test]
@@ -775,13 +876,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: false,
             export_type: Some(ExportType::Txt),
             export_path: validate_path(None, None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: false,
             custom_name: None,
             use_caller_id: false,
@@ -792,6 +894,7 @@ mod arg_tests {
             cleartext_password: None,
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -815,13 +918,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: false,
             export_type: Some(ExportType::Txt),
             export_path: validate_path(None, None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: false,
             custom_name: None,
             use_caller_id: false,
@@ -832,6 +936,7 @@ mod arg_tests {
             cleartext_password: Some("password".to_string()),
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -869,13 +974,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: false,
             export_type: Some(ExportType::Txt),
             export_path: validate_path(None, None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: false,
             custom_name: Some("Name".to_string()),
             use_caller_id: false,
@@ -886,6 +992,7 @@ mod arg_tests {
             cleartext_password: None,
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -901,13 +1008,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: false,
             export_type: Some(ExportType::Txt),
             export_path: validate_path(None, None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: false,
             custom_name: None,
             use_caller_id: true,
@@ -918,6 +1026,7 @@ mod arg_tests {
             cleartext_password: None,
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -934,13 +1043,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: false,
             export_type: Some(ExportType::Txt),
             export_path: validate_path(None, None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: false,
             custom_name: None,
             use_caller_id: false,
@@ -951,6 +1061,7 @@ mod arg_tests {
             cleartext_password: None,
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -966,13 +1077,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Full),
             diagnostic: false,
             export_type: Some(ExportType::Txt),
             export_path: validate_path(None, None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: false,
             custom_name: None,
             use_caller_id: false,
@@ -983,6 +1095,7 @@ mod arg_tests {
             cleartext_password: None,
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -998,13 +1111,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Clone),
             diagnostic: false,
             export_type: Some(ExportType::Txt),
             export_path: validate_path(None, None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: false,
             custom_name: None,
             use_caller_id: false,
@@ -1015,6 +1129,7 @@ mod arg_tests {
             cleartext_password: None,
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -1142,13 +1257,14 @@ mod arg_tests {
 
         // Expected data
         let expected = Options {
-            db_path: default_db_path(),
+            db_path: default_db_path().unwrap(),
             attachment_root: None,
             attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
             diagnostic: false,
             export_type: Some(ExportType::Txt),
             export_path: validate_path(None, None).unwrap(),
             query_context: QueryContext::default(),
+            timezone: Zone::Local,
             no_lazy: false,
             custom_name: None,
             use_caller_id: false,
@@ -1159,6 +1275,7 @@ mod arg_tests {
             cleartext_password: None,
             contacts_path: None,
             show_progress: true,
+            use_message_times: false,
         };
 
         assert_eq!(actual, expected);
@@ -1166,13 +1283,31 @@ mod arg_tests {
 
     #[test]
     fn cant_build_option_invalid_attachment_root() {
-        let args = get_command().get_matches_from(["imessage-exporter", "-r", "/does/not/exist"]);
+        let args = get_command().get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "txt",
+            "-r",
+            "/does/not/exist",
+        ]);
         assert!(Options::from_args(&args).is_err());
     }
 
     #[test]
     fn cant_build_option_invalid_contacts_path() {
-        let args = get_command().get_matches_from(["imessage-exporter", "-n", "/does/not/exist"]);
+        let args = get_command().get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "txt",
+            "-n",
+            "/does/not/exist",
+        ]);
+        assert!(Options::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn cant_build_option_db_path_only() {
+        let args = get_command().get_matches_from(["imessage-exporter", "-p", "/does/not/exist"]);
         assert!(Options::from_args(&args).is_err());
     }
 
@@ -1182,13 +1317,6 @@ mod arg_tests {
             get_command().get_matches_from(["imessage-exporter", "-f", "txt", "--no-progress"]);
         let actual = Options::from_args(&args).unwrap();
         assert!(!actual.show_progress);
-    }
-
-    #[test]
-    fn show_progress_defaults_to_true() {
-        let args = get_command().get_matches_from(["imessage-exporter", "-f", "txt"]);
-        let actual = Options::from_args(&args).unwrap();
-        assert!(actual.show_progress);
     }
 
     #[test]
@@ -1202,21 +1330,47 @@ mod arg_tests {
         let args = get_command().get_matches_from(["imessage-exporter", "-d", "--no-progress"]);
         assert!(Options::from_args(&args).is_err());
     }
+
+    #[test]
+    fn can_build_option_use_message_times() {
+        let args = get_command().get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "txt",
+            "--use-message-times",
+        ]);
+        let actual = Options::from_args(&args).unwrap();
+        assert!(actual.use_message_times);
+    }
+
+    #[test]
+    fn cant_build_option_use_message_times_no_export_type() {
+        let args = get_command().get_matches_from(["imessage-exporter", "--use-message-times"]);
+        let error = Options::from_args(&args).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid options!\nOption --use-message-times is enabled, which requires --format"
+        );
+    }
+
+    #[test]
+    fn cant_build_option_diagnostic_flag_with_use_message_times() {
+        let args =
+            get_command().get_matches_from(["imessage-exporter", "-d", "--use-message-times"]);
+        // `--use-message-times` requires `--format`, which diagnostics forbids.
+        assert!(Options::from_args(&args).is_err());
+    }
 }
 
 #[cfg(test)]
 mod path_tests {
     use std::fs;
-    use std::io::Write;
-    use std::path::PathBuf;
 
     use crate::app::{
         export_type::ExportType,
-        options::{DEFAULT_OUTPUT_DIR, validate_path},
+        options::{default_export_path, validate_path},
         test_dir::unique_test_dir,
     };
-
-    use imessage_database::util::dirs::home;
 
     #[test]
     fn can_validate_empty() {
@@ -1225,7 +1379,7 @@ mod path_tests {
         let export_path = Some(&dir_str);
         let export_type = Some(ExportType::Txt);
 
-        let result = validate_path(Some(&dir_str), export_type.as_ref());
+        let result = validate_path(export_path, export_type.as_ref());
 
         assert_eq!(result.unwrap(), dir);
     }
@@ -1233,33 +1387,33 @@ mod path_tests {
     #[test]
     fn can_validate_different_type() {
         let dir = unique_test_dir("validate-different-type");
+        fs::File::create(dir.join("fake.html")).unwrap();
         let dir_str = dir.to_string_lossy().into_owned();
         let export_path = Some(&dir_str);
         let export_type = Some(ExportType::Txt);
 
         let result = validate_path(export_path, export_type.as_ref());
 
-        let mut fake = dir.clone();
-        fake.push("fake1.html");
-        let mut file = fs::File::create(&fake).unwrap();
-        file.write_all(&[]).unwrap();
-
         assert_eq!(result.unwrap(), dir);
     }
 
     #[test]
-    fn can_validate_same_type() {
+    fn cant_validate_same_type() {
         let dir = unique_test_dir("validate-same-type");
+        fs::File::create(dir.join("fake.txt")).unwrap();
         let dir_str = dir.to_string_lossy().into_owned();
+        let export_path = Some(&dir_str);
+        let export_type = Some(ExportType::Txt);
 
-        let mut fake = dir.clone();
-        fake.push("fake2.txt");
-        let mut file = fs::File::create(&fake).unwrap();
-        file.write_all(&[]).unwrap();
+        let error = validate_path(export_path, export_type.as_ref()).unwrap_err();
 
-        let result = validate_path(Some(&dir_str), Some(&ExportType::Txt));
-
-        assert!(result.is_err(), "expected error, got: {:?}", result);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Invalid options!\nSpecified export path {} contains existing \"txt\" export data!",
+                dir.display()
+            )
+        );
     }
 
     #[test]
@@ -1269,9 +1423,6 @@ mod path_tests {
 
         let result = validate_path(export_path, export_type);
 
-        assert_eq!(
-            result.unwrap(),
-            PathBuf::from(&format!("{}/{DEFAULT_OUTPUT_DIR}", home()))
-        );
+        assert_eq!(result.unwrap(), default_export_path());
     }
 }
