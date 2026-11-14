@@ -10,8 +10,9 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt::Write as FmtWrite,
-    fs::File,
+    fs::{File, remove_file, rename},
     io::{BufWriter, IsTerminal, Write, stderr},
+    path::PathBuf,
 };
 
 use chrono::{DateTime, Datelike, NaiveDate};
@@ -50,6 +51,10 @@ use imessage_database::{
 
 /// File name (relative to the export path) of the unified timeline output.
 pub(crate) const TIMELINE_FILENAME: &str = "timeline.md";
+
+/// File name (relative to the export path) the timeline is written to
+/// before it replaces [`TIMELINE_FILENAME`] (djf.12 F8).
+pub(crate) const TIMELINE_PARTIAL_FILENAME: &str = "timeline.md.partial";
 
 /// Heading shown when a message has no associated chat.
 pub(crate) const ORPHANED_THREAD_LABEL: &str = "Orphaned messages (no associated chat)";
@@ -151,8 +156,14 @@ impl ThreadLabels {
 pub struct Timeline<'a> {
     /// Data that is set up from the application's runtime
     pub config: &'a Config,
-    /// The single output file we write the unified timeline into.
+    /// The temporary file the unified timeline is written into. It replaces
+    /// `timeline.md` only when the export succeeds (djf.12 F8).
     pub file: BufWriter<File>,
+    /// Where `file` is: [`TIMELINE_PARTIAL_FILENAME`] in the export path.
+    partial_path: PathBuf,
+    /// Where the finished timeline goes: [`TIMELINE_FILENAME`] in the
+    /// export path.
+    final_path: PathBuf,
     /// Messages collected and grouped by day (BTreeMap so days come out in
     /// chronological order) then by thread.
     ///
@@ -173,19 +184,20 @@ pub struct Timeline<'a> {
 // MARK: Exporter
 impl<'a> Timeline<'a> {
     pub fn new(config: &'a Config) -> Result<Self, RuntimeError> {
-        let mut path = config.options.export_path.clone();
-        path.push(TIMELINE_FILENAME);
+        let final_path = config.options.export_path.join(TIMELINE_FILENAME);
+        let partial_path = config.options.export_path.join(TIMELINE_PARTIAL_FILENAME);
 
-        // Truncate any prior timeline.md so reruns produce a clean file.
-        let file = File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+        // djf.12 F8: write a temporary file next to timeline.md and rename
+        // it over timeline.md only when the export succeeds, so a failed run
+        // leaves a previous timeline.md as it was. A temporary file left by
+        // a run that was killed is overwritten.
+        let file = File::create(&partial_path)?;
 
         Ok(Timeline {
             config,
             file: BufWriter::new(file),
+            partial_path,
+            final_path,
             grouped: BTreeMap::new(),
             thread_labels: ThreadLabels::default(),
             skipped_messages: 0,
@@ -193,7 +205,24 @@ impl<'a> Timeline<'a> {
         })
     }
 
+    /// Export every message into `timeline.md`. On failure, `timeline.md` is
+    /// left as it was and the temporary file is removed (djf.12 F8).
     pub fn iter_messages(&mut self) -> Result<(), RuntimeError> {
+        let result = self.write_timeline();
+        if result.is_err()
+            && let Err(why) = remove_file(&self.partial_path)
+        {
+            eprintln!(
+                "Warning: could not remove the incomplete timeline {}: {why}",
+                self.partial_path.display()
+            );
+        }
+        result
+    }
+
+    /// Write the whole timeline into the temporary file, then move it over
+    /// `timeline.md`.
+    fn write_timeline(&mut self) -> Result<(), RuntimeError> {
         eprintln!(
             "Exporting unified timeline to {} as markdown...",
             self.config.options.export_path.display()
@@ -248,7 +277,7 @@ impl<'a> Timeline<'a> {
         }
 
         self.flush_grouped()?;
-        self.file.flush().map_err(RuntimeError::DiskError)?;
+        self.finish()?;
         self.pb.finish();
 
         if self.skipped_messages > 0 {
@@ -316,6 +345,18 @@ impl<'a> Timeline<'a> {
             ),
             None => (ThreadKey::Orphaned, ORPHANED_THREAD_LABEL.to_string()),
         }
+    }
+
+    /// Flush the temporary file to disk and rename it over `timeline.md`
+    /// (djf.12 F8). A rename within one directory replaces the old file in
+    /// one step, so `timeline.md` is never half written.
+    fn finish(&mut self) -> Result<(), RuntimeError> {
+        self.file.flush().map_err(RuntimeError::DiskError)?;
+        self.file
+            .get_ref()
+            .sync_all()
+            .map_err(RuntimeError::DiskError)?;
+        rename(&self.partial_path, &self.final_path).map_err(RuntimeError::DiskError)
     }
 
     /// Write all collected messages out to the timeline file as Markdown.
@@ -1412,7 +1453,7 @@ mod tests {
         exporter.collect_message(&msg, block).unwrap();
 
         exporter.flush_grouped().unwrap();
-        exporter.file.flush().unwrap();
+        exporter.finish().unwrap();
         drop(exporter);
 
         let path = tmp_dir.join(TIMELINE_FILENAME);
@@ -1473,7 +1514,7 @@ mod tests {
             .unwrap();
 
         exporter.flush_grouped().unwrap();
-        exporter.file.flush().unwrap();
+        exporter.finish().unwrap();
         drop(exporter);
 
         let path = tmp_dir.join(TIMELINE_FILENAME);
@@ -1526,7 +1567,7 @@ mod tests {
             .unwrap();
 
         exporter.flush_grouped().unwrap();
-        exporter.file.flush().unwrap();
+        exporter.finish().unwrap();
         drop(exporter);
 
         let path = tmp_dir.join(TIMELINE_FILENAME);
@@ -2156,6 +2197,72 @@ mod tests {
         }
         let message_headers = contents.lines().filter(|l| l.starts_with("**")).count();
         assert_eq!(message_headers, 3, "got:\n{contents}");
+    }
+
+    // MARK: Failed exports (djf.12 F8)
+    /// A copy of the fixture `test.db` plus one message row that cannot be
+    /// read at all: its date is text, so reading the row fails and the
+    /// export stops. Text sorts after numbers, so it is read last, after the
+    /// timeline file has been written to.
+    fn db_with_unparseable_row() -> std::path::PathBuf {
+        let test_data = std::env::current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("imessage-database/test_data");
+        let path = unique_test_dir("timeline-unparseable-db").join("chat.db");
+        std::fs::copy(test_data.join("db/test.db"), &path).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "INSERT INTO message (ROWID, guid, date, is_from_me, text) \
+             VALUES (9200, 'timeline-test-unparseable', 'not a date', 1, 'x')",
+            [],
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn failed_export_leaves_the_previous_timeline_unchanged() {
+        let mut options = isolated_options("failed_export_leaves_the_previous_timeline_unchanged");
+        options.db_path = db_with_unparseable_row();
+        let export_path = options.export_path.clone();
+        let previous = "# Monday, January 5, 2026\n\n## An earlier export\n\nkept as is\n";
+        std::fs::write(export_path.join(TIMELINE_FILENAME), previous).unwrap();
+        let config = Config::fake_app(options);
+
+        let mut exporter = Timeline::new(&config).unwrap();
+        // The export stops at the unparseable row, after writing has begun.
+        let error = exporter.iter_messages().unwrap_err();
+        assert!(
+            matches!(error, RuntimeError::DatabaseError(_)) && error.to_string().contains("date"),
+            "got: {error}"
+        );
+        drop(exporter);
+
+        assert_eq!(
+            std::fs::read_to_string(export_path.join(TIMELINE_FILENAME)).unwrap(),
+            previous
+        );
+        assert!(!export_path.join(TIMELINE_PARTIAL_FILENAME).exists());
+    }
+
+    #[test]
+    fn successful_export_replaces_the_previous_timeline() {
+        let mut options = isolated_options("successful_export_replaces_the_previous_timeline");
+        options.db_path = db_with_unreadable_message();
+        let export_path = options.export_path.clone();
+        std::fs::write(export_path.join(TIMELINE_FILENAME), "an earlier export\n").unwrap();
+        let config = Config::fake_app(options);
+
+        let mut exporter = Timeline::new(&config).unwrap();
+        exporter.iter_messages().unwrap();
+        drop(exporter);
+
+        let contents = std::fs::read_to_string(export_path.join(TIMELINE_FILENAME)).unwrap();
+        assert!(contents.starts_with("# "), "got:\n{contents}");
+        assert!(!contents.contains("an earlier export"), "got:\n{contents}");
+        assert!(!export_path.join(TIMELINE_PARTIAL_FILENAME).exists());
     }
 
     // MARK: Block-start escape (djf.9, djf.12 F1)
