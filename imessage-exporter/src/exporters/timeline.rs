@@ -28,6 +28,7 @@ use crate::{
         shared::{
             announcement::{YOU, resolve_announcement},
             balloon::rewrite_fitness_receiver,
+            part::{AttachmentResolver, resolve_run},
         },
         timeline_balloons::render_app_balloon,
     },
@@ -63,6 +64,9 @@ pub(crate) const APP_MESSAGE_PLACEHOLDER: &str = "[App message]";
 /// U+FFFC, which Messages puts in a message's text where an attachment or an
 /// app balloon sits.
 const OBJECT_REPLACEMENT_CHAR: char = '\u{FFFC}';
+
+/// Shown for an attachment range with no matching attachment row.
+const ATTACHMENT_MISSING_LABEL: &str = "*[Attachment: missing]*";
 
 /// Shown in place of a time when a message's date cannot be converted.
 const UNKNOWN_TIME: &str = "(unknown time)";
@@ -467,7 +471,11 @@ impl<'a> Timeline<'a> {
             msg,
             &self.config.data_source.capabilities,
         )?;
-        let mut attachment_index: usize = 0;
+        // djf.12 F3: pair each attachment range with its own attachment by
+        // file-transfer GUID, as TXT and HTML do. Built once per message,
+        // because GUID-less (legacy) ranges fall back to a positional cursor
+        // that runs across the message's parts.
+        let mut resolver = AttachmentResolver::new(&attachments);
         let mut wrote_body = false;
 
         // Render text, attachment and app components in order. Text and
@@ -476,13 +484,13 @@ impl<'a> Timeline<'a> {
         for (part_index, component) in msg.components.iter().enumerate() {
             match component {
                 BubbleComponent::Run(ranges) => {
-                    // Render text ranges and inline attachment ranges in order.
+                    // Render the run's text, then one label per attachment
+                    // range in body order.
                     let text_ranges: Vec<AttributedRange> = ranges
                         .iter()
                         .filter(|r| r.attachment.is_none())
                         .cloned()
                         .collect();
-                    let has_attachments = ranges.iter().any(|r| r.attachment.is_some());
                     // djf.2: the timeline shows only the latest text of an
                     // edited part, so say that it was edited.
                     let edited = msg.is_part_edited(part_index);
@@ -515,26 +523,22 @@ impl<'a> Timeline<'a> {
                         wrote_body = true;
                     }
 
-                    if has_attachments {
-                        if let Some(att) = attachments.get(attachment_index) {
-                            // djf.8: name a sticker as a sticker, as TXT does.
-                            let (kind, fallback) = if att.is_sticker {
-                                ("Sticker", "sticker")
-                            } else {
-                                ("Attachment", "attachment")
-                            };
-                            let label = att
-                                .filename()
-                                .or(att.transfer_name.as_deref())
-                                .unwrap_or(fallback);
-                            let _ = writeln!(out, "*[{kind}: {label}]*");
-                            out.push('\n');
-                            wrote_body = true;
-                            attachment_index += 1;
-                        } else {
-                            out.push_str("*[Attachment: missing]*\n\n");
-                            wrote_body = true;
+                    // djf.12 F3: one label per attachment range, so a bubble
+                    // with several inline stickers or genmoji names each one.
+                    for (_, index) in resolve_run(ranges, &mut resolver) {
+                        let Some(index) = index else {
+                            continue;
+                        };
+                        match attachments.get(index) {
+                            Some(att) => {
+                                let _ = writeln!(out, "{}", attachment_label(att));
+                            }
+                            None => {
+                                let _ = writeln!(out, "{ATTACHMENT_MISSING_LABEL}");
+                            }
                         }
+                        out.push('\n');
+                        wrote_body = true;
                     }
                 }
                 BubbleComponent::App => {
@@ -828,6 +832,21 @@ fn slice_text_for_bubble(text: &str, attributes: &[AttributedRange]) -> String {
         }
     }
     out
+}
+
+/// The italic label naming one attachment, e.g. `*[Attachment: photo.jpg]*`.
+/// A sticker is named a sticker, as TXT does (djf.8).
+fn attachment_label(att: &Attachment) -> String {
+    let (kind, fallback) = if att.is_sticker {
+        ("Sticker", "sticker")
+    } else {
+        ("Attachment", "attachment")
+    };
+    let label = att
+        .filename()
+        .or(att.transfer_name.as_deref())
+        .unwrap_or(fallback);
+    format!("*[{kind}: {label}]*")
 }
 
 /// The timeline's output for an app message before balloons were rendered:
@@ -1514,6 +1533,13 @@ mod tests {
     const NEXT_DAY_PARENT_GUID: &str = "timeline-test-parent-next-day";
     const NEXT_DAY_REPLY_GUID: &str = "timeline-test-reply-next-day";
     const ONE_DAY: i64 = 86_400_000_000_000;
+    /// A message whose body is upstream's typedstream fixture
+    /// `FormattedInlineStickers`: one bubble, two inline stickers.
+    const INLINE_STICKERS_ROW: i32 = 9030;
+    const INLINE_STICKERS_GUID: &str = "timeline-test-inline-stickers";
+    /// The two stickers' file-transfer GUIDs, as the fixture body names them.
+    const FIRST_STICKER_GUID: &str = "1E50CD07-D8F7-4CF1-A662-B23262B9D492";
+    const SECOND_STICKER_GUID: &str = "49769DA1-FF04-4381-8982-B4810F0EB971";
     /// A rowid with no row in the scratch database, so it has no payload.
     const MISSING_ROW: i32 = 9999;
     const POLL_GUID: &str = "timeline-test-poll";
@@ -1658,6 +1684,34 @@ mod tests {
                 ],
             )
             .unwrap();
+
+            // djf.12 F3: a bubble with two inline stickers. The join rows
+            // list the second sticker first, so pairing by position would
+            // name the stickers in the wrong order.
+            let body = std::fs::read(test_data.join("typedstream/FormattedInlineStickers")).unwrap();
+            db.execute(
+                "INSERT INTO message (ROWID, guid, date, is_from_me, attributedBody) \
+                 VALUES (?1, ?2, ?3, 1, ?4)",
+                params![INLINE_STICKERS_ROW, INLINE_STICKERS_GUID, SAMPLE_DATE, body],
+            )
+            .unwrap();
+            for (attachment_rowid, guid, name) in [
+                (9103, SECOND_STICKER_GUID, "second-sticker.heic"),
+                (9104, FIRST_STICKER_GUID, "first-sticker.heic"),
+            ] {
+                db.execute(
+                    "INSERT INTO attachment (ROWID, guid, original_guid, transfer_name, is_sticker) \
+                     VALUES (?1, ?2, ?2, ?3, 1)",
+                    params![attachment_rowid, guid, name],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO message_attachment_join (message_id, attachment_id) \
+                     VALUES (?1, ?2)",
+                    params![INLINE_STICKERS_ROW, attachment_rowid],
+                )
+                .unwrap();
+            }
             path
         })
     }
@@ -1924,6 +1978,65 @@ mod tests {
                 .format_timeline_message(&attachment_message(PHOTO_ROW))
                 .unwrap(),
             "**5:29:42 PM — Me**\n\n*[Attachment: photo.jpg]*\n\n"
+        );
+    }
+
+    #[test]
+    fn every_inline_sticker_in_a_bubble_is_named_by_its_guid() {
+        // djf.12 F3: the timeline named at most one attachment per bubble,
+        // and paired attachments with bubbles by position.
+        let config = seeded_config("every_inline_sticker_in_a_bubble_is_named_by_its_guid");
+        let exporter = Timeline::new(&config).unwrap();
+        let message = Message::from_guid(
+            INLINE_STICKERS_GUID,
+            config.data_source.db(),
+            &config.data_source.capabilities,
+        )
+        .unwrap();
+
+        // The fixture body: two inline sticker ranges, by GUID, in this order.
+        let BubbleComponent::Run(ranges) = &message.components[0] else {
+            panic!("expected one run, got {:?}", message.components);
+        };
+        let range_guids: Vec<&str> = ranges
+            .iter()
+            .filter_map(|r| r.attachment.as_ref()?.guid.as_deref())
+            .collect();
+        assert_eq!(range_guids, [FIRST_STICKER_GUID, SECOND_STICKER_GUID]);
+        // The database returns the stickers in the other order.
+        let attachments = Attachment::from_message(
+            config.data_source.db(),
+            &message,
+            &config.data_source.capabilities,
+        )
+        .unwrap();
+        let row_guids: Vec<&str> = attachments
+            .iter()
+            .filter_map(|a| a.guid.as_deref())
+            .collect();
+        assert_eq!(row_guids, [SECOND_STICKER_GUID, FIRST_STICKER_GUID]);
+
+        assert_eq!(
+            exporter.format_timeline_message(&message).unwrap(),
+            "**5:29:42 PM — Me**\n\n🫪🙏\n\n*[Sticker: first-sticker.heic]*\n\n*[Sticker: second-sticker.heic]*\n\n"
+        );
+    }
+
+    #[test]
+    fn attachment_range_with_no_attachment_row_is_named_missing() {
+        let config = seeded_config("attachment_range_with_no_attachment_row_is_named_missing");
+        let exporter = Timeline::new(&config).unwrap();
+        // Two attachment ranges, but the message has no attachment rows.
+        let mut message = attachment_message(MISSING_ROW);
+        message.text = Some("\u{FFFC}\u{FFFC}".to_string());
+        message.components = vec![BubbleComponent::Run(vec![
+            AttributedRange::attachment(0, 3, AttachmentMeta::default()),
+            AttributedRange::attachment(3, 6, AttachmentMeta::default()),
+        ])];
+
+        assert_eq!(
+            exporter.format_timeline_message(&message).unwrap(),
+            "**5:29:42 PM — Me**\n\n*[Attachment: missing]*\n\n*[Attachment: missing]*\n\n"
         );
     }
 
