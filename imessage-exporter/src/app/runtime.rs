@@ -39,6 +39,19 @@ use crate::{
 // Fork-owned (-w): a separate import, so upstream's block above keeps upstream's text and future syncs conflict less.
 use crate::app::options::{OPTION_CONVERSATION_FILTER, OPTION_CONVERSATION_WITH};
 
+/// Fork-owned (-w): what [`Config::resolve_exact_match_chats`] found for the `--conversation-with` groups.
+struct ExactMatches {
+    /// Chat row IDs to export.
+    chats: BTreeSet<i32>,
+    /// Groups, as typed, whose names all resolved but that matched no conversation (djf.12 F4).
+    unmatched_groups: Vec<String>,
+}
+
+/// Fork-owned (-w, djf.12 F4): the warning for a `--conversation-with` group that matched no conversation.
+fn unmatched_group_warning(group: &str) -> String {
+    format!("Warning: --{OPTION_CONVERSATION_WITH} group `{group}` matched no conversation")
+}
+
 // Maximum filename length before accounting for the export path.
 const MAX_LENGTH: usize = 235;
 /// Separator between participant names in a generated filename.
@@ -389,8 +402,12 @@ impl Config {
 
         // Exact-match filter (`-w`)
         if has_with {
-            let exact_chats = self.resolve_exact_match_chats(&mut included_handles);
-            included_chatrooms.extend(exact_chats);
+            let exact = self.resolve_exact_match_chats(&mut included_handles);
+            // djf.12 F4: name each group that matched no conversation; the groups that matched still export.
+            for group in &exact.unmatched_groups {
+                eprintln!("{}", unmatched_group_warning(group));
+            }
+            included_chatrooms.extend(exact.chats);
         }
 
         if included_chatrooms.is_empty() {
@@ -417,8 +434,9 @@ impl Config {
     /// As a side effect, every raw handle id of every resolved participant is
     /// added to `included_handles` so diagnostic logging in
     /// [`Config::log_filtered_handles_and_chats`] reflects the full filter.
-    fn resolve_exact_match_chats(&self, included_handles: &mut BTreeSet<i32>) -> BTreeSet<i32> {
+    fn resolve_exact_match_chats(&self, included_handles: &mut BTreeSet<i32>) -> ExactMatches {
         let mut included: BTreeSet<i32> = BTreeSet::new();
+        let mut unmatched_groups: Vec<String> = Vec::new();
 
         for group_str in &self.options.conversation_with {
             let tokens: Vec<&str> = group_str
@@ -470,6 +488,7 @@ impl Config {
                 continue;
             }
 
+            let mut group_matched = false;
             for (chat_id, raw_participants) in &self.chatroom_participants {
                 let chat_deduped: BTreeSet<i32> = raw_participants
                     .iter()
@@ -482,10 +501,18 @@ impl Config {
                 if chat_deduped == resolved_deduped {
                     included.insert(*chat_id);
                     included_handles.extend(&all_raw_handles);
+                    group_matched = true;
                 }
             }
+            // djf.12 F4: every name resolved, yet no conversation has exactly these participants.
+            if !group_matched {
+                unmatched_groups.push(group_str.clone());
+            }
         }
-        included
+        ExactMatches {
+            chats: included,
+            unmatched_groups,
+        }
     }
 
     /// Log the number of handles and chats selected by the participant filter.
@@ -1721,6 +1748,7 @@ mod directory_tests {
 mod conversation_with_tests {
     use std::collections::BTreeSet;
 
+    use super::unmatched_group_warning;
     use crate::{
         Config, Options,
         app::{contacts::Name, export_type::ExportType},
@@ -1976,6 +2004,45 @@ mod conversation_with_tests {
             app.options.query_context.selected_chat_ids,
             Some(BTreeSet::from([1]))
         );
+    }
+
+    #[test]
+    fn group_that_matches_no_conversation_is_named_and_the_others_still_export() {
+        // djf.12 F4. Charlie is only in the Alice+Bob+Charlie group (chat 4), so
+        // `Alice,Charlie` resolves every name yet is no chat's exact participant set.
+        // `Alice,Nobody` has a name that resolves to no one: its token warning
+        // already covers it, so it is not listed again.
+        let mut app = fixture_with_three_people();
+        app.options.conversation_with = vec![
+            String::from("Alice"),
+            String::from("Alice,Charlie"),
+            String::from("Alice,Nobody"),
+        ];
+
+        let exact = app.resolve_exact_match_chats(&mut BTreeSet::new());
+        assert_eq!(exact.chats, BTreeSet::from([1]));
+        assert_eq!(exact.unmatched_groups, vec![String::from("Alice,Charlie")]);
+        assert_eq!(
+            unmatched_group_warning("Alice,Charlie"),
+            "Warning: --conversation-with group `Alice,Charlie` matched no conversation"
+        );
+
+        // The Alice DM still exports: the unmatched group is a warning, not an error.
+        app.resolve_filtered_handles().unwrap();
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([1]))
+        );
+    }
+
+    #[test]
+    fn groups_that_all_match_leave_nothing_to_warn_about() {
+        let mut app = fixture_with_three_people();
+        app.options.conversation_with = vec![String::from("Alice"), String::from("Alice,Bob")];
+
+        let exact = app.resolve_exact_match_chats(&mut BTreeSet::new());
+        assert_eq!(exact.chats, BTreeSet::from([1, 2]));
+        assert!(exact.unmatched_groups.is_empty());
     }
 }
 
