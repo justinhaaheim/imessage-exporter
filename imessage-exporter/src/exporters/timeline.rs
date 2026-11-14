@@ -8,7 +8,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write as FmtWrite,
     fs::{File, remove_file, rename},
     io::{BufWriter, IsTerminal, Write, stderr},
@@ -657,31 +657,42 @@ impl<'a> Timeline<'a> {
         }
 
         // Replies: render each as a blockquote so the threading is visible.
-        // Every nested copy sits under the day of the outermost message.
-        let shown_on = match placement {
-            Placement::OwnDay => self.local_date_time(msg).map(|d| d.date_naive()),
-            Placement::Nested { shown_on } => shown_on,
-        };
+        // djf.16 R4: replies nest one level deep. The nested copy of a reply
+        // does not show that reply's own replies; they are nested under the
+        // reply's own block, under its own day, so each shows once there.
+        if placement == Placement::OwnDay {
+            out.push_str(&self.format_nested_replies(msg)?);
+        }
+
+        Ok(out)
+    }
+
+    /// The replies to `msg`, each as a blockquote, for its block under its own
+    /// day. Each reply shows once (djf.16 R4): upstream's `get_replies` reads
+    /// a reply once per chat it is joined to.
+    fn format_nested_replies(&self, msg: &Message) -> Result<String, TableError> {
+        let mut out = String::new();
+        let shown_on = self.local_date_time(msg).map(|d| d.date_naive());
+        let placement = Placement::Nested { shown_on };
         let replies = msg.get_replies(
             self.config.data_source.db(),
             &self.config.data_source.capabilities,
         )?;
         let mut reply_keys: Vec<usize> = replies.keys().copied().collect();
         reply_keys.sort_unstable();
-        for k in reply_keys {
-            if let Some(reply_set) = replies.get(&k) {
-                for reply in reply_set {
-                    if reply.is_tapback() || reply.is_poll_vote() || reply.is_poll_update() {
-                        continue;
-                    }
-                    let nested =
-                        self.format_message_block(reply, Placement::Nested { shown_on })?;
-                    out.push_str(&blockquote(&nested));
-                    out.push('\n');
-                }
+        let mut shown: HashSet<i32> = HashSet::new();
+        for reply in reply_keys.iter().filter_map(|k| replies.get(k)).flatten() {
+            if reply.is_tapback()
+                || reply.is_poll_vote()
+                || reply.is_poll_update()
+                || !shown.insert(reply.rowid)
+            {
+                continue;
             }
+            let nested = self.format_message_block(reply, placement)?;
+            out.push_str(&blockquote(&nested));
+            out.push('\n');
         }
-
         Ok(out)
     }
 
@@ -2916,6 +2927,150 @@ mod tests {
         assert_eq!(
             exporter.format_timeline_message(&reply).unwrap(),
             "**5:29:42 PM — Me**\n\n*(reply to an earlier message)*\n\norphaned reply\n\n"
+        );
+    }
+
+    // MARK: Nested replies (djf.16 R3, R4)
+    const REPLIES_PARENT_GUID: &str = "timeline-test-replies-parent";
+    const UNSENT_REPLY_GUID: &str = "timeline-test-unsent-reply";
+    const TWO_CHAT_REPLY_TEXT: &str = "reply joined to two chats";
+    const REPLY_WITH_A_REPLY_GUID: &str = "timeline-test-reply-with-a-reply";
+    const REPLY_WITH_A_REPLY_TEXT: &str = "a reply that has a reply";
+    const REPLY_TO_A_REPLY_TEXT: &str = "a reply to a reply";
+
+    /// A copy of the fixture `test.db` with a parent message from me and its
+    /// replies, each a second apart, from 5:29:42 PM PT on May 17, 2022:
+    ///
+    /// - a reply that was later unsent (upstream's `Deleted.plist` summary);
+    /// - a reply joined to two chats, which upstream's `get_replies` reads twice;
+    /// - a reply that has a reply of its own.
+    fn db_with_replies() -> std::path::PathBuf {
+        let test_data = std::env::current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("imessage-database/test_data");
+        let path = unique_test_dir("timeline-replies-db").join("chat.db");
+        std::fs::copy(test_data.join("db/test.db"), &path).unwrap();
+        let unsent_summary = std::fs::read(test_data.join("edited_message/Deleted.plist")).unwrap();
+
+        let db = Connection::open(&path).unwrap();
+        // The fixture has no chat rows; the join rows below point at none.
+        db.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        let second = 1_000_000_000;
+        for (rowid, guid, text, offset, parent) in [
+            (9040, REPLIES_PARENT_GUID, Some("parent"), 0, None),
+            (9041, UNSENT_REPLY_GUID, None, 1, Some(REPLIES_PARENT_GUID)),
+            (
+                9042,
+                "timeline-test-two-chat-reply",
+                Some(TWO_CHAT_REPLY_TEXT),
+                2,
+                Some(REPLIES_PARENT_GUID),
+            ),
+            (
+                9043,
+                REPLY_WITH_A_REPLY_GUID,
+                Some(REPLY_WITH_A_REPLY_TEXT),
+                3,
+                Some(REPLIES_PARENT_GUID),
+            ),
+            (
+                9044,
+                "timeline-test-reply-to-a-reply",
+                Some(REPLY_TO_A_REPLY_TEXT),
+                4,
+                Some(REPLY_WITH_A_REPLY_GUID),
+            ),
+        ] {
+            db.execute(
+                "INSERT INTO message (ROWID, guid, date, is_from_me, text, thread_originator_guid) \
+                 VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+                params![rowid, guid, SAMPLE_DATE + offset * second, text, parent],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "UPDATE message SET date_edited = ?1, message_summary_info = ?2 WHERE ROWID = 9041",
+            params![SAMPLE_DATE + 10 * second, unsent_summary],
+        )
+        .unwrap();
+        for chat_id in [9001, 9002] {
+            db.execute(
+                "INSERT INTO chat_message_join (chat_id, message_id) VALUES (?1, 9042)",
+                params![chat_id],
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    /// A timeline exporter config that reads [`db_with_replies`].
+    fn replies_config(test_name: &str) -> Config {
+        let mut options = isolated_options(test_name);
+        options.db_path = db_with_replies();
+        Config::fake_app(options)
+    }
+
+    /// The message with `guid`, read from the database as an export reads it.
+    fn read_message(config: &Config, guid: &str) -> Message {
+        Message::from_guid(
+            guid,
+            config.data_source.db(),
+            &config.data_source.capabilities,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reply_joined_to_two_chats_is_nested_once() {
+        let config = replies_config("reply_joined_to_two_chats_is_nested_once");
+        let exporter = Timeline::new(&config).unwrap();
+        let parent = read_message(&config, REPLIES_PARENT_GUID);
+        // Upstream reads the reply once per chat it is joined to.
+        let replies = parent
+            .get_replies(config.data_source.db(), &config.data_source.capabilities)
+            .unwrap();
+        let two_chat_rows = replies
+            .values()
+            .flatten()
+            .filter(|reply| reply.rowid == 9042)
+            .count();
+        assert_eq!(two_chat_rows, 2);
+
+        let block = exporter.format_timeline_message(&parent).unwrap();
+        assert_eq!(
+            block.matches(TWO_CHAT_REPLY_TEXT).count(),
+            1,
+            "got:\n{block}"
+        );
+    }
+
+    #[test]
+    fn replies_nest_one_level_deep() {
+        // djf.16 R4: a reply to a reply was nested under its parent's own
+        // block and again inside the nested copy of that parent.
+        let config = replies_config("replies_nest_one_level_deep");
+        let exporter = Timeline::new(&config).unwrap();
+
+        let parent = exporter
+            .format_timeline_message(&read_message(&config, REPLIES_PARENT_GUID))
+            .unwrap();
+        assert!(
+            parent.contains(&format!("> {REPLY_WITH_A_REPLY_TEXT}\n")),
+            "got:\n{parent}"
+        );
+        assert!(!parent.contains(REPLY_TO_A_REPLY_TEXT), "got:\n{parent}");
+        assert!(!parent.contains("> > "), "got:\n{parent}");
+
+        let reply = exporter
+            .format_timeline_message(&read_message(&config, REPLY_WITH_A_REPLY_GUID))
+            .unwrap();
+        assert_eq!(
+            reply,
+            format!(
+                "**5:29:45 PM — Me**\n\n*(reply to a message from Tue, May 17, 2022 5:29:42 PM)*\n\n{REPLY_WITH_A_REPLY_TEXT}\n\n> **5:29:46 PM — Me**\n>\n> {REPLY_TO_A_REPLY_TEXT}\n>\n\n"
+            )
         );
     }
 
