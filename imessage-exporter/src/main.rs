@@ -22,10 +22,13 @@ fn main() -> ExitCode {
     match options {
         Ok(options) => match Config::new(options) {
             Ok(mut app) => {
-                // Resolve the filtered contacts, if provided
+                // Resolve the filtered contacts, if provided. A filter that matches no chat is an error: exit non-zero, export nothing.
                 if let Err(why) = app.resolve_filtered_handles() {
                     eprintln!("Unable to export: {why}");
-                } else if let Err(why) = app.start() {
+                    return ExitCode::FAILURE;
+                }
+
+                if let Err(why) = app.start() {
                     eprintln!("Unable to export: {why}");
                     return ExitCode::FAILURE;
                 }
