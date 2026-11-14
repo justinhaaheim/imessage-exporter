@@ -31,12 +31,13 @@ use crate::{
     HTML, TXT, Timeline,
     app::{
         compatibility::attachment_manager::AttachmentManagerMode, contacts::Name,
-        data_source::DataSource, error::RuntimeError, export_type::ExportType,
-        options::{OPTION_CONVERSATION_FILTER, OPTION_CONVERSATION_WITH, Options},
+        data_source::DataSource, error::RuntimeError, export_type::ExportType, options::Options,
         sanitizers::sanitize_filename,
     },
     exporters::shared::driver::run_export,
 };
+// Fork-owned (-w): a separate import, so upstream's block above keeps upstream's text and future syncs conflict less.
+use crate::app::options::{OPTION_CONVERSATION_FILTER, OPTION_CONVERSATION_WITH};
 
 // Maximum filename length before accounting for the export path.
 const MAX_LENGTH: usize = 235;
@@ -1890,8 +1891,7 @@ mod conversation_with_tests {
         // Loose-OR filter: any chat with Charlie (i.e. just chat 4)
         app.options.conversation_filter = Some(String::from("Charlie"));
         // Exact match: alice DM (chat 1) and alice+bob group (chat 2)
-        app.options.conversation_with =
-            vec![String::from("Alice"), String::from("Alice,Bob")];
+        app.options.conversation_with = vec![String::from("Alice"), String::from("Alice,Bob")];
 
         app.resolve_filtered_handles().unwrap();
 

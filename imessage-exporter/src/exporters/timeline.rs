@@ -164,7 +164,6 @@ impl<'a> Timeline<'a> {
         self.pb.finish();
         Ok(())
     }
-
 }
 
 // MARK: Grouping
@@ -205,10 +204,7 @@ impl<'a> Timeline<'a> {
                 ThreadKey::Chat(*real_id),
                 chat_display_label(self.config, chatroom),
             ),
-            None => (
-                ThreadKey::Orphaned,
-                ORPHANED_THREAD_LABEL.to_string(),
-            ),
+            None => (ThreadKey::Orphaned, ORPHANED_THREAD_LABEL.to_string()),
         }
     }
 
@@ -279,11 +275,9 @@ impl<'a> Timeline<'a> {
         let mut out = String::with_capacity(256);
 
         let time = self.format_time_of_day(msg);
-        let sender = self.config.who(
-            msg.handle_id,
-            msg.is_from_me(),
-            &msg.destination_caller_id,
-        );
+        let sender = self
+            .config
+            .who(msg.handle_id, msg.is_from_me(), &msg.destination_caller_id);
 
         // Header line: bold time + em-dash + bold sender.
         let _ = writeln!(out, "**{time} — {sender}**");
@@ -316,8 +310,11 @@ impl<'a> Timeline<'a> {
             match component {
                 BubbleComponent::Run(ranges) => {
                     // Render text ranges and inline attachment ranges in order.
-                    let text_ranges: Vec<AttributedRange> =
-                        ranges.iter().filter(|r| r.attachment.is_none()).cloned().collect();
+                    let text_ranges: Vec<AttributedRange> = ranges
+                        .iter()
+                        .filter(|r| r.attachment.is_none())
+                        .cloned()
+                        .collect();
                     let has_attachments = ranges.iter().any(|r| r.attachment.is_some());
 
                     if let Some(text) = &msg.text {
@@ -367,9 +364,7 @@ impl<'a> Timeline<'a> {
         }
 
         // If the components vector was empty but we have text, render it.
-        if !wrote_body
-            && let Some(text) = &msg.text
-        {
+        if !wrote_body && let Some(text) = &msg.text {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
                 let _ = writeln!(out, "{trimmed}");
@@ -433,11 +428,9 @@ impl<'a> Timeline<'a> {
             if matches!(action, TapbackAction::Removed) {
                 return None;
             }
-            let who = self.config.who(
-                msg.handle_id,
-                msg.is_from_me(),
-                &msg.destination_caller_id,
-            );
+            let who = self
+                .config
+                .who(msg.handle_id, msg.is_from_me(), &msg.destination_caller_id);
             return Some(match tapback {
                 Tapback::Sticker => format!("Sticker from {who}"),
                 _ => format!("{tapback} by {who}"),
@@ -724,10 +717,7 @@ mod tests {
 
     #[test]
     fn thread_header_uses_h2() {
-        assert_eq!(
-            format_thread_header("Andrew"),
-            "## Andrew\n\n".to_string()
-        );
+        assert_eq!(format_thread_header("Andrew"), "## Andrew\n\n".to_string());
     }
 
     #[test]
@@ -829,8 +819,9 @@ mod tests {
         // Reproduces the bug where a message split into multiple Text bubbles
         // (e.g. mention + plain text) would render the entire `msg.text`
         // body once per Text bubble.
-        let config =
-            Config::fake_app(isolated_options("multi_text_bubble_message_does_not_duplicate_text"));
+        let config = Config::fake_app(isolated_options(
+            "multi_text_bubble_message_does_not_duplicate_text",
+        ));
         let exporter = Timeline::new(&config).unwrap();
 
         let mut message = Config::fake_message();
@@ -839,11 +830,7 @@ mod tests {
         message.is_from_me = true;
         // Two text bubbles: "Hi Alice" + ", how are you?"
         message.components = vec![
-            BubbleComponent::Run(vec![AttributedRange::text(
-                0,
-                8,
-                vec![TextEffect::Default],
-            )]),
+            BubbleComponent::Run(vec![AttributedRange::text(0, 8, vec![TextEffect::Default])]),
             BubbleComponent::Run(vec![AttributedRange::text(
                 8,
                 22,
@@ -853,8 +840,7 @@ mod tests {
 
         let actual = exporter.format_timeline_message(&message).unwrap();
         // Each bubble's slice appears once and on its own line.
-        let expected =
-            "**5:29:42 PM — Me**\n\nHi Alice\n\n, how are you?\n\n";
+        let expected = "**5:29:42 PM — Me**\n\nHi Alice\n\n, how are you?\n\n";
         assert_eq!(actual, expected);
     }
 
@@ -1012,9 +998,7 @@ mod tests {
             "EarlyThread should appear before LateThread; got:\n{contents}"
         );
 
-        let early_block_pos = contents
-            .find("EARLY-BLOCK")
-            .expect("missing EARLY-BLOCK");
+        let early_block_pos = contents.find("EARLY-BLOCK").expect("missing EARLY-BLOCK");
         let late_block_pos = contents.find("LATE-BLOCK").expect("missing LATE-BLOCK");
         assert!(early_block_pos < late_block_pos);
     }

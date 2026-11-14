@@ -1166,13 +1166,8 @@ mod arg_tests {
     #[test]
     fn can_build_option_conversation_with_single() {
         let command = get_command();
-        let args = command.get_matches_from([
-            "imessage-exporter",
-            "-f",
-            "txt",
-            "-w",
-            "alice@apple.com",
-        ]);
+        let args =
+            command.get_matches_from(["imessage-exporter", "-f", "txt", "-w", "alice@apple.com"]);
         let actual = Options::from_args(&args).unwrap();
         assert_eq!(
             actual.conversation_with,
@@ -1214,10 +1209,7 @@ mod arg_tests {
         ]);
         let actual = Options::from_args(&args).unwrap();
         assert_eq!(actual.conversation_filter, Some(String::from("charlie")));
-        assert_eq!(
-            actual.conversation_with,
-            vec![String::from("alice,bob")]
-        );
+        assert_eq!(actual.conversation_with, vec![String::from("alice,bob")]);
     }
 
     #[test]
