@@ -23,7 +23,13 @@ use crate::{
         runtime::{Config, ORPHANED, UNKNOWN},
         zone::Zone,
     },
-    exporters::shared::announcement::{YOU, resolve_announcement},
+    exporters::{
+        shared::{
+            announcement::{YOU, resolve_announcement},
+            balloon::rewrite_fitness_receiver,
+        },
+        timeline_balloons::render_app_balloon,
+    },
 };
 
 use imessage_database::{
@@ -44,6 +50,13 @@ pub(crate) const TIMELINE_FILENAME: &str = "timeline.md";
 
 /// Heading shown when a message has no associated chat.
 pub(crate) const ORPHANED_THREAD_LABEL: &str = "Orphaned messages (no associated chat)";
+
+/// Shown after a message part that was edited. The timeline shows only the
+/// latest text; the TXT export shows the full edit history.
+pub(crate) const EDITED_MARKER: &str = "*(edited)*";
+
+/// Shown for an app message whose balloon cannot be rendered and that has no text.
+pub(crate) const APP_MESSAGE_PLACEHOLDER: &str = "[App message]";
 
 // MARK: ThreadKey
 /// Key used to group messages by thread within a single day.
@@ -302,11 +315,10 @@ impl<'a> Timeline<'a> {
         let mut attachment_index: usize = 0;
         let mut wrote_body = false;
 
-        // Render text and attachment components in order. We deliberately
-        // keep this simpler than the TXT exporter — apps and balloons are
-        // rendered as their text or a generic placeholder, which is enough
-        // for the v1 timeline view.
-        for component in &msg.components {
+        // Render text, attachment and app components in order. Text and
+        // attachments stay simpler than the TXT exporter (attachments are
+        // named, not embedded); app balloons show the same fields TXT shows.
+        for (part_index, component) in msg.components.iter().enumerate() {
             match component {
                 BubbleComponent::Run(ranges) => {
                     // Render text ranges and inline attachment ranges in order.
@@ -316,15 +328,33 @@ impl<'a> Timeline<'a> {
                         .cloned()
                         .collect();
                     let has_attachments = ranges.iter().any(|r| r.attachment.is_some());
+                    // djf.2: the timeline shows only the latest text of an
+                    // edited part, so say that it was edited.
+                    let edited = msg.is_part_edited(part_index);
+                    let mut marked_edited = false;
 
                     if let Some(text) = &msg.text {
-                        let slice = slice_text_for_bubble(text, &text_ranges);
+                        // As TXT does for text bubbles, read Fitness's
+                        // receiver placeholder as "You".
+                        let slice =
+                            rewrite_fitness_receiver(slice_text_for_bubble(text, &text_ranges));
                         let trimmed = slice.trim();
                         if !trimmed.is_empty() {
-                            let _ = writeln!(out, "{trimmed}");
+                            if edited {
+                                let _ = writeln!(out, "{trimmed} {EDITED_MARKER}");
+                                marked_edited = true;
+                            } else {
+                                let _ = writeln!(out, "{trimmed}");
+                            }
                             out.push('\n');
                             wrote_body = true;
                         }
+                    }
+
+                    if edited && !marked_edited {
+                        let _ = writeln!(out, "{EDITED_MARKER}");
+                        out.push('\n');
+                        wrote_body = true;
                     }
 
                     if has_attachments {
@@ -344,15 +374,13 @@ impl<'a> Timeline<'a> {
                     }
                 }
                 BubbleComponent::App => {
-                    // Try to render the app's text if any; otherwise show a
-                    // generic placeholder.
-                    let label = msg
-                        .text
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("[App message]");
-                    let _ = writeln!(out, "*{label}*");
+                    // djf.2: render the balloon through upstream's decision
+                    // tree. If the payload is missing or unreadable, keep the
+                    // output the timeline had before balloons were rendered,
+                    // so one bad balloon never fails the export.
+                    let block = render_app_balloon(self.config, msg, &attachments)
+                        .unwrap_or_else(|_| app_message_fallback(msg));
+                    let _ = writeln!(out, "{block}");
                     out.push('\n');
                     wrote_body = true;
                 }
@@ -624,6 +652,19 @@ fn slice_text_for_bubble(text: &str, attributes: &[AttributedRange]) -> String {
     out
 }
 
+/// The timeline's output for an app message before balloons were rendered:
+/// the message text in italics, or `*[App message]*` when there is none.
+/// Used when upstream's balloon dispatcher returns an error.
+fn app_message_fallback(msg: &Message) -> String {
+    let label = msg
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(APP_MESSAGE_PLACEHOLDER);
+    format!("*{label}*")
+}
+
 /// Prefix every line of `text` with `> ` for a Markdown blockquote.
 fn blockquote(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 16);
@@ -676,18 +717,25 @@ pub(crate) fn chat_display_label(config: &Config, chatroom: &Chat) -> String {
 // MARK: Tests
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use super::*;
     use crate::{
         Config, Options,
-        app::{contacts::Name, export_type::ExportType},
+        app::{contacts::Name, export_type::ExportType, test_dir::unique_test_dir},
+        exporters::shared::test_support::SAMPLE_DATE,
     };
     use chrono::NaiveDate;
     use imessage_database::{
-        message_types::text_effects::text_effect::TextEffect,
+        message_types::{
+            edited::{EditStatus, EditedMessage, EditedMessagePart},
+            text_effects::text_effect::TextEffect,
+        },
+        rusqlite::{Connection, params},
         tables::{
             chat::Chat,
             messages::models::{AttributedRange, BubbleComponent},
-            table::ME,
+            table::{FITNESS_RECEIVER, ME},
         },
     };
 
@@ -1061,6 +1109,332 @@ mod tests {
             .filter(|l| l.starts_with("# ") && !l.starts_with("## "))
             .count();
         assert_eq!(h1_count, 2, "expected 2 H1 day headers; got {header_count}");
+    }
+
+    // MARK: App balloons (djf.2)
+    /// Balloon bundle IDs as Messages stores them.
+    const URL_BUNDLE: &str = "com.apple.messages.URLBalloonProvider";
+    const POLL_BUNDLE: &str = "com.apple.messages.Polls";
+    const OPENTABLE_BUNDLE: &str = "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.opentable.OpenTable.OpenTableMessagesExtension";
+
+    /// Rows added to the scratch database. Each carries one of upstream's
+    /// fixture payloads from `imessage-database/test_data/`.
+    const URL_ROW: i32 = 9001;
+    const MUSIC_ROW: i32 = 9002;
+    const POLL_ROW: i32 = 9003;
+    const OPENTABLE_ROW: i32 = 9006;
+    /// A rowid with no row in the scratch database, so it has no payload.
+    const MISSING_ROW: i32 = 9999;
+    const POLL_GUID: &str = "timeline-test-poll";
+
+    /// The path of a copy of the fixture `test.db` with app balloon rows
+    /// added, made once per test process. Payloads are read from the
+    /// database by rowid, so a balloon cannot be rendered end to end without
+    /// a real row. The fixture itself is never written to.
+    fn seeded_db() -> &'static std::path::Path {
+        static DB: OnceLock<std::path::PathBuf> = OnceLock::new();
+        DB.get_or_init(|| {
+            let test_data = std::env::current_dir()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("imessage-database/test_data");
+            let path = unique_test_dir("timeline-balloons-db").join("chat.db");
+            std::fs::copy(test_data.join("db/test.db"), &path).unwrap();
+
+            let rows = [
+                SeedRow::balloon(
+                    URL_ROW,
+                    "timeline-test-url",
+                    URL_BUNDLE,
+                    "url_message/MetadataURL.plist",
+                ),
+                SeedRow::balloon(
+                    MUSIC_ROW,
+                    "timeline-test-music",
+                    URL_BUNDLE,
+                    "music_message/AppleMusic.plist",
+                ),
+                SeedRow::balloon(
+                    POLL_ROW,
+                    POLL_GUID,
+                    POLL_BUNDLE,
+                    "app_message/PollCreate.plist",
+                ),
+                SeedRow::vote(
+                    9004,
+                    "timeline-test-vote-1",
+                    "app_message/PollVote.plist",
+                    1,
+                ),
+                SeedRow::vote(
+                    9005,
+                    "timeline-test-vote-2",
+                    "app_message/PollVote2.plist",
+                    2,
+                ),
+                SeedRow::balloon(
+                    OPENTABLE_ROW,
+                    "timeline-test-opentable",
+                    OPENTABLE_BUNDLE,
+                    "app_message/OpenTableInvited.plist",
+                ),
+            ];
+
+            let db = Connection::open(&path).unwrap();
+            for row in rows {
+                let payload = std::fs::read(test_data.join(row.payload)).unwrap();
+                db.execute(
+                    "INSERT INTO message (ROWID, guid, date, is_from_me, balloon_bundle_id, \
+                     associated_message_guid, associated_message_type, payload_data) \
+                     VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)",
+                    params![
+                        row.rowid,
+                        row.guid,
+                        row.date,
+                        row.bundle_id,
+                        row.associated_guid,
+                        row.associated_type,
+                        payload
+                    ],
+                )
+                .unwrap();
+            }
+            path
+        })
+    }
+
+    /// One message row added to the scratch database.
+    struct SeedRow {
+        rowid: i32,
+        guid: &'static str,
+        bundle_id: &'static str,
+        associated_guid: Option<&'static str>,
+        associated_type: i32,
+        /// Fixture path under `imessage-database/test_data/`.
+        payload: &'static str,
+        date: i64,
+    }
+
+    impl SeedRow {
+        /// A message whose body is one app balloon.
+        fn balloon(
+            rowid: i32,
+            guid: &'static str,
+            bundle_id: &'static str,
+            payload: &'static str,
+        ) -> Self {
+            Self {
+                rowid,
+                guid,
+                bundle_id,
+                associated_guid: None,
+                associated_type: 0,
+                payload,
+                date: SAMPLE_DATE,
+            }
+        }
+
+        /// A vote on the seeded poll, `order` nanoseconds after it.
+        fn vote(rowid: i32, guid: &'static str, payload: &'static str, order: i64) -> Self {
+            Self {
+                rowid,
+                guid,
+                bundle_id: POLL_BUNDLE,
+                associated_guid: Some(POLL_GUID),
+                associated_type: 4000,
+                payload,
+                date: SAMPLE_DATE + order,
+            }
+        }
+    }
+
+    /// A timeline exporter config that reads the seeded database.
+    fn seeded_config(test_name: &str) -> Config {
+        let mut options = isolated_options(test_name);
+        options.db_path = seeded_db().to_path_buf();
+        Config::fake_app(options)
+    }
+
+    /// An app message from me at 5:29:42 PM PT whose body is one app balloon.
+    fn app_message(rowid: i32, guid: &str, bundle_id: &str, text: Option<&str>) -> Message {
+        let mut message = Config::fake_message();
+        message.rowid = rowid;
+        message.guid = guid.to_string();
+        message.date = SAMPLE_DATE;
+        message.is_from_me = true;
+        message.balloon_bundle_id = Some(bundle_id.to_string());
+        message.text = text.map(str::to_string);
+        message.components = vec![BubbleComponent::App];
+        message
+    }
+
+    #[test]
+    fn url_preview_renders_link_title_and_summary() {
+        let config = seeded_config("url_preview_renders_link_title_and_summary");
+        let exporter = Timeline::new(&config).unwrap();
+        let message = app_message(
+            URL_ROW,
+            "timeline-test-url",
+            URL_BUNDLE,
+            Some("https://chrissardegna.com"),
+        );
+
+        let actual = exporter.format_timeline_message(&message).unwrap();
+
+        assert_eq!(
+            actual,
+            "**5:29:42 PM — Me**\n\n*Link*\n<https://chrissardegna.com>\nChristopher Sardegna\nSample page description\n\n"
+        );
+    }
+
+    #[test]
+    fn url_without_preview_payload_renders_its_text_as_the_link() {
+        let config = seeded_config("url_without_preview_payload_renders_its_text_as_the_link");
+        let exporter = Timeline::new(&config).unwrap();
+        let message = app_message(
+            MISSING_ROW,
+            "timeline-test-no-preview",
+            URL_BUNDLE,
+            Some("https://example.com/no-preview"),
+        );
+
+        let actual = exporter.format_timeline_message(&message).unwrap();
+
+        assert_eq!(
+            actual,
+            "**5:29:42 PM — Me**\n\n*Link*\n<https://example.com/no-preview>\n\n"
+        );
+    }
+
+    #[test]
+    fn apple_music_share_renders_track_album_artist_and_link() {
+        let config = seeded_config("apple_music_share_renders_track_album_artist_and_link");
+        let exporter = Timeline::new(&config).unwrap();
+        let message = app_message(MUSIC_ROW, "timeline-test-music", URL_BUNDLE, None);
+
+        let actual = exporter.format_timeline_message(&message).unwrap();
+
+        assert_eq!(
+            actual,
+            "**5:29:42 PM — Me**\n\n*Music*\nПеснь 1\nПанихида\nБАТЮШКА\n<https://music.apple.com/us/album/%D0%BF%D0%B5%D1%81%D0%BD%D1%8C-1/1539641998?i=1539641999>\n\n"
+        );
+    }
+
+    #[test]
+    fn poll_renders_options_with_votes_and_voters() {
+        let config = seeded_config("poll_renders_options_with_votes_and_voters");
+        let exporter = Timeline::new(&config).unwrap();
+        let message = app_message(POLL_ROW, POLL_GUID, POLL_BUNDLE, None);
+
+        let actual = exporter.format_timeline_message(&message).unwrap();
+
+        assert_eq!(
+            actual,
+            "**5:29:42 PM — Me**\n\n*Poll*\n- Option 1 (1)\n  - steven@applenet.com\n- Option 2 (2)\n  - +12223334444\n  - steven@applenet.com\n- Option 3 (0)\n- Option 4 (0)\n\n"
+        );
+    }
+
+    #[test]
+    fn generic_app_renders_its_name_and_fields() {
+        let config = seeded_config("generic_app_renders_its_name_and_fields");
+        let exporter = Timeline::new(&config).unwrap();
+        let message = app_message(
+            OPENTABLE_ROW,
+            "timeline-test-opentable",
+            OPENTABLE_BUNDLE,
+            None,
+        );
+
+        let actual = exporter.format_timeline_message(&message).unwrap();
+
+        assert_eq!(
+            actual,
+            "**5:29:42 PM — Me**\n\n*OpenTable*\nRusty Grill - Boise\nReservation Confirmed\nTable for 4 people\nSunday, October 17 at 7:45 PM\nYou're invited! Tap to accept.\n\n"
+        );
+    }
+
+    #[test]
+    fn unreadable_app_balloon_falls_back_to_the_old_output() {
+        let config = seeded_config("unreadable_app_balloon_falls_back_to_the_old_output");
+        let exporter = Timeline::new(&config).unwrap();
+
+        // No payload row: upstream's dispatcher returns an error for each.
+        let no_text = app_message(MISSING_ROW, "timeline-test-x", OPENTABLE_BUNDLE, None);
+        let with_text = app_message(
+            MISSING_ROW,
+            "timeline-test-y",
+            OPENTABLE_BUNDLE,
+            Some("  hello  "),
+        );
+        let url_no_text = app_message(MISSING_ROW, "timeline-test-z", URL_BUNDLE, None);
+        for message in [&no_text, &with_text, &url_no_text] {
+            assert!(render_app_balloon(&config, message, &[]).is_err());
+        }
+
+        assert_eq!(
+            exporter.format_timeline_message(&no_text).unwrap(),
+            "**5:29:42 PM — Me**\n\n*[App message]*\n\n"
+        );
+        assert_eq!(
+            exporter.format_timeline_message(&with_text).unwrap(),
+            "**5:29:42 PM — Me**\n\n*hello*\n\n"
+        );
+        assert_eq!(
+            exporter.format_timeline_message(&url_no_text).unwrap(),
+            "**5:29:42 PM — Me**\n\n*[App message]*\n\n"
+        );
+    }
+
+    #[test]
+    fn edited_part_is_marked_edited() {
+        let config = Config::fake_app(isolated_options("edited_part_is_marked_edited"));
+        let exporter = Timeline::new(&config).unwrap();
+
+        let mut message = Config::fake_message_with_text("Final wording");
+        message.date = SAMPLE_DATE;
+        message.is_from_me = true;
+        message.date_edited = SAMPLE_DATE + 60_000_000_000;
+        message.edited_parts = Some(EditedMessage {
+            parts: vec![EditedMessagePart {
+                status: EditStatus::Edited,
+                edit_history: vec![],
+                unsend_failed: false,
+            }],
+            unsupported_handles: vec![],
+        });
+
+        let actual = exporter.format_timeline_message(&message).unwrap();
+        assert_eq!(
+            actual,
+            "**5:29:42 PM — Me**\n\nFinal wording *(edited)*\n\n"
+        );
+
+        // A part that was not edited gets no marker.
+        if let Some(parts) = message.edited_parts.as_mut() {
+            parts.parts[0].status = EditStatus::Original;
+        }
+        let actual = exporter.format_timeline_message(&message).unwrap();
+        assert_eq!(actual, "**5:29:42 PM — Me**\n\nFinal wording\n\n");
+    }
+
+    #[test]
+    fn fitness_receiver_placeholder_reads_as_you() {
+        let config = Config::fake_app(isolated_options(
+            "fitness_receiver_placeholder_reads_as_you",
+        ));
+        let exporter = Timeline::new(&config).unwrap();
+
+        let mut message =
+            Config::fake_message_with_text(format!("{FITNESS_RECEIVER} closed all three rings"));
+        message.date = SAMPLE_DATE;
+        message.is_from_me = true;
+
+        let actual = exporter.format_timeline_message(&message).unwrap();
+        assert_eq!(
+            actual,
+            "**5:29:42 PM — Me**\n\nYou closed all three rings\n\n"
+        );
     }
 
     fn tempdir_for_test(name: &str) -> std::path::PathBuf {
