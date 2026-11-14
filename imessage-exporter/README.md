@@ -47,7 +47,7 @@ The [releases page](https://github.com/ReagentX/imessage-exporter/releases) prov
 -d, --diagnostics
         Print diagnostic information and exit
         
--f, --format <txt, html>
+-f, --format <txt, html, timeline>
         Specify a single file format to export messages into
         
 -c, --copy-method <clone, basic, full, disabled>
@@ -112,6 +112,17 @@ The [releases page](https://github.com/ReagentX/imessage-exporter/releases) prov
         To provide multiple filter criteria, use a comma-separated string
         All conversations with the specified participants are exported, including group conversations
         Example: `-t steve@apple.com,5558675309`
+        
+-w, --conversation-with <participants>
+        Select a specific conversation by exact participant set
+        Each -w value lists the comma-separated participants of one conversation
+        (without yourself); only conversations whose deduplicated participant set
+        equals that list are exported
+        Repeat the flag to select multiple specific conversations (results are unioned)
+        May be combined with --conversation-filter; results are unioned
+        Example: `-w 5558675309` selects only your DM with that number
+        Example: `-w "alice@apple.com,5558675309"` selects only the group chat with exactly those two
+        Example: `-w alice -w "alice,bob"` selects both the alice DM and the alice+bob group
         
 -x, --cleartext-password <password>
         Optional password for encrypted iOS backups
@@ -209,6 +220,18 @@ Export messages from participants using email addresses but not phone numbers as
 
 ```zsh
 imessage-exporter -f html -t "@"
+```
+
+Export every conversation as a single Markdown file, `timeline.md`, grouped by day and then by conversation, from the default iMessage Database location to your home directory:
+
+```zsh
+imessage-exporter -f timeline
+```
+
+Export only your direct conversation with `5558675309`, not the group conversations that include that number, as `timeline` from the default iMessage Database location to your home directory:
+
+```zsh
+imessage-exporter -f timeline -w "5558675309"
 ```
 
 ## Features
