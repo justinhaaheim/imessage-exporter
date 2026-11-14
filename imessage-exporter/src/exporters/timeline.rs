@@ -81,7 +81,7 @@ const ATTACHMENT_MISSING_LABEL: &str = "*[Attachment: missing]*";
 const UNKNOWN_TIME: &str = "(unknown time)";
 
 /// Shown under a reply's header in its own day when the message it answers
-/// cannot be found (djf.12 F2).
+/// cannot be found (djf.12 F2) or read (djf.16 R8).
 const REPLY_TO_UNKNOWN_PARENT: &str = "*(reply to an earlier message)*";
 
 // MARK: Placement
@@ -449,10 +449,11 @@ impl<'a> Timeline<'a> {
     /// this reply's other copy may sit under another day.
     ///
     /// A parent that is not in the database, or whose date cannot be
-    /// converted, gives `*(reply to an earlier message)*`. Any other database
-    /// error is returned, so the message is reported and skipped like any
-    /// other message that cannot be read (djf.7).
-    fn format_reply_context(&self, parent_guid: &str) -> Result<String, TableError> {
+    /// converted, gives `*(reply to an earlier message)*`. So does a parent
+    /// that cannot be read for any other reason, after a warning on stderr
+    /// naming `reply` (djf.16 R8): the reply itself is readable, so it stays
+    /// in the timeline.
+    fn format_reply_context(&self, reply: &Message, parent_guid: &str) -> String {
         let parent = match Message::from_guid(
             parent_guid,
             self.config.data_source.db(),
@@ -460,14 +461,15 @@ impl<'a> Timeline<'a> {
         ) {
             Ok(parent) => Some(parent),
             Err(TableError::QueryError(rusqlite::Error::QueryReturnedNoRows)) => None,
-            Err(why) => return Err(why),
+            Err(why) => {
+                eprintln!("{}", parent_lookup_warning(reply, &why));
+                None
+            }
         };
-        Ok(
-            match parent.as_ref().and_then(|p| self.local_date_time(p)) {
-                Some(sent) => format!("*(reply to a message from {})*", format_date_time(&sent)),
-                None => REPLY_TO_UNKNOWN_PARENT.to_string(),
-            },
-        )
+        match parent.as_ref().and_then(|p| self.local_date_time(p)) {
+            Some(sent) => format!("*(reply to a message from {})*", format_date_time(&sent)),
+            None => REPLY_TO_UNKNOWN_PARENT.to_string(),
+        }
     }
 
     /// Build the full Markdown block for a single (non-announcement) message
@@ -503,7 +505,7 @@ impl<'a> Timeline<'a> {
         if placement == Placement::OwnDay
             && let Some(parent_guid) = &msg.thread_originator_guid
         {
-            let _ = writeln!(out, "{}", self.format_reply_context(parent_guid)?);
+            let _ = writeln!(out, "{}", self.format_reply_context(msg, parent_guid));
             out.push('\n');
         }
 
@@ -849,6 +851,15 @@ impl<'a> Timeline<'a> {
 }
 
 // MARK: Free helpers
+/// The stderr warning for a reply whose parent message cannot be read
+/// (djf.16 R8). It names the reply, which stays in the timeline.
+fn parent_lookup_warning(reply: &Message, why: &TableError) -> String {
+    format!(
+        "Warning: could not read the message that message (rowid={}, guid={}) replies to, so it is shown as a reply to an earlier message: {why}",
+        reply.rowid, reply.guid
+    )
+}
+
 /// Format a `DateTime` in the export's timezone as "5:29:42 PM". Uses `%-l`
 /// (unpadded 12-hour) so we don't need to trim a leading space the way the
 /// `imessage_database::util::dates::format` helper would.
@@ -3085,6 +3096,50 @@ mod tests {
             format!(
                 "**5:29:45 PM — Me**\n\n*(reply to a message from Tue, May 17, 2022 5:29:42 PM)*\n\n{REPLY_WITH_A_REPLY_TEXT}\n\n> **5:29:46 PM — Me**\n>\n> {REPLY_TO_A_REPLY_TEXT}\n>\n\n"
             )
+        );
+    }
+
+    #[test]
+    fn reply_whose_parent_cannot_be_read_stays_and_says_an_earlier_message() {
+        // djf.16 R8: an error reading the parent, other than its absence,
+        // used to skip the reply, which itself is readable.
+        let mut options =
+            isolated_options("reply_whose_parent_cannot_be_read_stays_and_says_an_earlier_message");
+        options.db_path = db_with_unparseable_row();
+        let config = Config::fake_app(options);
+        let exporter = Timeline::new(&config).unwrap();
+        // The parent row exists but cannot be read: its date is text.
+        let lookup = Message::from_guid(
+            "timeline-test-unparseable",
+            config.data_source.db(),
+            &config.data_source.capabilities,
+        );
+        assert!(
+            matches!(
+                &lookup,
+                Err(why) if !matches!(
+                    why,
+                    TableError::QueryError(rusqlite::Error::QueryReturnedNoRows)
+                )
+            ),
+            "the parent lookup did not fail as intended"
+        );
+
+        let mut reply = Config::fake_message_with_text("readable reply");
+        reply.rowid = 9201;
+        reply.guid = "timeline-test-reply-to-unparseable".to_string();
+        reply.date = SAMPLE_DATE;
+        reply.is_from_me = true;
+        reply.thread_originator_guid = Some("timeline-test-unparseable".to_string());
+        assert_eq!(
+            exporter.format_timeline_message(&reply).unwrap(),
+            "**5:29:42 PM — Me**\n\n*(reply to an earlier message)*\n\nreadable reply\n\n"
+        );
+
+        let warning = parent_lookup_warning(&reply, &lookup.unwrap_err());
+        assert!(
+            warning.starts_with("Warning: could not read the message that message (rowid=9201, guid=timeline-test-reply-to-unparseable) replies to"),
+            "got: {warning}"
         );
     }
 
