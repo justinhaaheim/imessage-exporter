@@ -670,10 +670,12 @@ mod arg_tests {
     use crate::app::{
         compatibility::attachment_manager::{AttachmentManager, AttachmentManagerMode},
         export_type::ExportType,
-        options::{Options, get_command, timeline_ignored_options, validate_path},
+        options::{Options, get_command, validate_path},
         test_dir::unique_test_dir,
         zone::Zone,
     };
+    // Fork-owned (djf.12 F11): a separate import, so upstream's block above keeps upstream's text.
+    use crate::app::options::timeline_ignored_options;
 
     #[test]
     fn can_build_option_diagnostic_flag() {
