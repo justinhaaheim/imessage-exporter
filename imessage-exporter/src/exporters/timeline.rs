@@ -7,6 +7,7 @@
 */
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt::Write as FmtWrite,
     fs::File,
@@ -346,6 +347,7 @@ impl<'a> Timeline<'a> {
         if let Some(subject) = &msg.subject
             && !subject.is_empty()
         {
+            let subject = escape_heading_lines(subject);
             let _ = writeln!(out, "*Subject:* {subject}");
             out.push('\n');
         }
@@ -383,6 +385,8 @@ impl<'a> Timeline<'a> {
                             rewrite_fitness_receiver(slice_text_for_bubble(text, &text_ranges));
                         let trimmed = slice.trim();
                         if !trimmed.is_empty() {
+                            // djf.9: no line of the text may read as a heading.
+                            let trimmed = escape_heading_lines(trimmed);
                             if edited {
                                 let _ = writeln!(out, "{trimmed} {EDITED_MARKER}");
                                 marked_edited = true;
@@ -444,6 +448,7 @@ impl<'a> Timeline<'a> {
         if !wrote_body && let Some(text) = &msg.text {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
+                let trimmed = escape_heading_lines(trimmed);
                 let _ = writeln!(out, "{trimmed}");
                 out.push('\n');
             }
@@ -718,7 +723,62 @@ fn app_message_fallback(msg: &Message) -> String {
                 .all(|c| c == OBJECT_REPLACEMENT_CHAR || c.is_whitespace())
         })
         .unwrap_or(APP_MESSAGE_PLACEHOLDER);
-    format!("*{label}*")
+    // djf.9: a later line of a multi-line text could read as a heading.
+    format!("*{}*", escape_heading_lines(label))
+}
+
+/// Escape every line of `text` that CommonMark would read as an ATX heading
+/// (djf.9), so message text never looks like a day or thread heading.
+///
+/// A heading line is up to three spaces, then one to six `#`, then a space,
+/// a tab or the end of the line. A backslash goes before its first `#`, which
+/// Markdown renders as a plain `#`. Hashtags such as `#blessed` (no space
+/// after the `#`), seven or more `#`, and lines indented four or more spaces
+/// are left alone, because none of them is a heading. Lines end at `\n` or
+/// `\r`, as in CommonMark. Escaping an escaped line changes nothing.
+pub(crate) fn escape_heading_lines(text: &str) -> Cow<'_, str> {
+    let mut escaped: Option<String> = None;
+    let mut copied = 0;
+    let mut line_start = 0;
+    loop {
+        let rest = &text[line_start..];
+        if let Some(indent) = heading_marker_indent(rest) {
+            let hash_at = line_start + indent;
+            let out = escaped.get_or_insert_with(|| String::with_capacity(text.len() + 8));
+            out.push_str(&text[copied..hash_at]);
+            out.push('\\');
+            copied = hash_at;
+        }
+        match rest.find(['\n', '\r']) {
+            Some(end) => line_start += end + 1,
+            None => break,
+        }
+    }
+    match escaped {
+        Some(mut out) => {
+            out.push_str(&text[copied..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(text),
+    }
+}
+
+/// The number of leading spaces when `line` starts with an ATX heading
+/// marker, else `None`. `line` may run past its own line ending.
+fn heading_marker_indent(line: &str) -> Option<usize> {
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let after_indent = &line.as_bytes()[indent..];
+    let hashes = after_indent.iter().take_while(|&&b| b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    match after_indent.get(hashes) {
+        None | Some(b' ' | b'\t' | b'\n' | b'\r') => Some(indent),
+        Some(_) => None,
+    }
 }
 
 /// Prefix every line of `text` with `> ` for a Markdown blockquote.
@@ -1237,6 +1297,9 @@ mod tests {
     /// Message rowids joined to a sticker and to an ordinary attachment.
     const STICKER_ROW: i32 = 9007;
     const PHOTO_ROW: i32 = 9008;
+    /// A parent message whose one reply is at `PARENT_ROW + 1`.
+    const PARENT_ROW: i32 = 9020;
+    const PARENT_GUID: &str = "timeline-test-parent";
     /// A rowid with no row in the scratch database, so it has no payload.
     const MISSING_ROW: i32 = 9999;
     const POLL_GUID: &str = "timeline-test-poll";
@@ -1348,6 +1411,20 @@ mod tests {
                 )
                 .unwrap();
             }
+
+            // djf.9: a parent message and a reply whose text reads as a heading.
+            db.execute(
+                "INSERT INTO message (ROWID, guid, date, is_from_me, text) \
+                 VALUES (?1, ?2, ?3, 1, 'parent')",
+                params![PARENT_ROW, PARENT_GUID, SAMPLE_DATE],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO message (ROWID, guid, date, is_from_me, text, thread_originator_guid) \
+                 VALUES (?1, 'timeline-test-reply', ?2, 1, '# reply heading', ?3)",
+                params![PARENT_ROW + 1, SAMPLE_DATE + 1, PARENT_GUID],
+            )
+            .unwrap();
             path
         })
     }
@@ -1614,6 +1691,97 @@ mod tests {
                 .format_timeline_message(&attachment_message(PHOTO_ROW))
                 .unwrap(),
             "**5:29:42 PM — Me**\n\n*[Attachment: photo.jpg]*\n\n"
+        );
+    }
+
+    // MARK: Heading escape (djf.9)
+    #[test]
+    fn escape_heading_lines_escapes_only_atx_headings() {
+        for (input, expected) in [
+            ("# hi", "\\# hi"),
+            ("## hi", "\\## hi"),
+            ("   # hi", "   \\# hi"),
+            ("###### six", "\\###### six"),
+            ("#", "\\#"),
+            ("#\tafter a tab", "\\#\tafter a tab"),
+            // Not headings: left alone.
+            ("#blessed", "#blessed"),
+            ("####### x", "####### x"),
+            ("    # four spaces is code", "    # four spaces is code"),
+            ("a # in the middle", "a # in the middle"),
+            ("- # in a list item", "- # in a list item"),
+            ("", ""),
+            // Every line is checked, after `\n`, `\r\n` or `\r`.
+            (
+                "intro\n# one\n#two\n## three",
+                "intro\n\\# one\n#two\n\\## three",
+            ),
+            ("intro\r\n# one\r# two", "intro\r\n\\# one\r\\# two"),
+            ("# trailing\n", "\\# trailing\n"),
+        ] {
+            assert_eq!(escape_heading_lines(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn escape_heading_lines_is_idempotent_and_borrows_when_unchanged() {
+        let once = escape_heading_lines("# a\n   ## b").into_owned();
+        assert_eq!(escape_heading_lines(&once), once);
+        assert!(matches!(escape_heading_lines("#blessed"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn heading_shaped_message_lines_are_escaped() {
+        let config = Config::fake_app(isolated_options("heading_shaped_message_lines_are_escaped"));
+        let exporter = Timeline::new(&config).unwrap();
+
+        let mut message =
+            Config::fake_message_with_text("# hi\n## hi\n   # hi\n#blessed\n####### x");
+        message.date = SAMPLE_DATE;
+        message.is_from_me = true;
+        message.subject = Some("Plans\n# not a heading".to_string());
+
+        let actual = exporter.format_timeline_message(&message).unwrap();
+        assert_eq!(
+            actual,
+            "**5:29:42 PM — Me**\n\n*Subject:* Plans\n\\# not a heading\n\n\\# hi\n\\## hi\n   \\# hi\n#blessed\n####### x\n\n"
+        );
+    }
+
+    #[test]
+    fn heading_shaped_reply_line_is_escaped_inside_the_blockquote() {
+        let config = seeded_config("heading_shaped_reply_line_is_escaped_inside_the_blockquote");
+        let exporter = Timeline::new(&config).unwrap();
+
+        let mut parent = Config::fake_message_with_text("parent");
+        parent.rowid = PARENT_ROW;
+        parent.guid = PARENT_GUID.to_string();
+        parent.date = SAMPLE_DATE;
+        parent.is_from_me = true;
+        parent.num_replies = 1;
+
+        let actual = exporter.format_timeline_message(&parent).unwrap();
+        assert_eq!(
+            actual,
+            "**5:29:42 PM — Me**\n\nparent\n\n> **5:29:42 PM — Me**\n>\n> \\# reply heading\n>\n\n"
+        );
+    }
+
+    #[test]
+    fn heading_shaped_line_in_app_fallback_text_is_escaped() {
+        let config = seeded_config("heading_shaped_line_in_app_fallback_text_is_escaped");
+        let exporter = Timeline::new(&config).unwrap();
+        let message = app_message(
+            MISSING_ROW,
+            "timeline-test-heading-fallback",
+            OPENTABLE_BUNDLE,
+            Some("first\n# second"),
+        );
+        assert!(render_app_balloon(&config, &message, &[]).is_err());
+
+        assert_eq!(
+            exporter.format_timeline_message(&message).unwrap(),
+            "**5:29:42 PM — Me**\n\n*first\n\\# second*\n\n"
         );
     }
 

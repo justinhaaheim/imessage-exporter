@@ -12,8 +12,9 @@
  `*<app name>*` for other apps), then one line per present field. URLs are
  Markdown autolinks (`<https://…>`). The label replaces TXT's own naming
  words (`"<app> message:"`, `" transaction:"`, `"Photo album:"`), so those
- words are not repeated. No escaping layer is added: field text is written
- as parsed, the same way the timeline writes message text.
+ words are not repeated. Field text is written as parsed, the same way the
+ timeline writes message text, with one exception: a line that Markdown
+ would read as a heading gets a backslash before its first `#` (djf.9).
 */
 
 use std::borrow::Cow;
@@ -36,6 +37,7 @@ use crate::{
             balloon::{dispatch_app_balloon, resolve_check_in_footer},
             text::OptionalText,
         },
+        timeline::escape_heading_lines,
     },
 };
 
@@ -135,9 +137,9 @@ impl BalloonFormatter for TimelineBalloons<'_> {
         // leading spaces as emphasis, lists or indented code.
         let ascii = balloon.render_ascii(HANDWRITING_ASCII_WIDTH);
         let mut out = Balloon::new("Handwriting");
-        out.line("```")
-            .line(ascii.trim_end_matches('\n'))
-            .line("```");
+        out.raw_line("```")
+            .raw_line(ascii.trim_end_matches('\n'))
+            .raw_line("```");
         out.finish()
     }
 
@@ -266,8 +268,15 @@ impl Balloon {
         Self(format!("*{label}*"))
     }
 
-    /// Append `text` as its own line.
+    /// Append `text` as its own line, escaping any line of it that would read
+    /// as a Markdown heading (djf.9).
     fn line(&mut self, text: &str) -> &mut Self {
+        self.raw_line(&escape_heading_lines(text))
+    }
+
+    /// Append `text` as its own line, unchanged. For lines inside a fenced
+    /// code block, where a backslash would show literally.
+    fn raw_line(&mut self, text: &str) -> &mut Self {
         self.0.push('\n');
         self.0.push_str(text);
         self
@@ -808,6 +817,54 @@ mod tests {
         assert_eq!(
             formatter.format_generic_app(&balloon, "", &[], &Config::fake_message()),
             "*App*\nYour move."
+        );
+    }
+
+    #[test]
+    fn heading_shaped_field_lines_are_escaped() {
+        // djf.9: a field line that reads as a heading gets a backslash.
+        let config = config();
+        let formatter = TimelineBalloons { config: &config };
+
+        let mut balloon = empty_app_message();
+        balloon.app_name = Some("Game");
+        balloon.title = Some("# Title");
+        balloon.caption = Some("Caption\n   ## second line");
+        balloon.subcaption = Some("#hashtag");
+        assert_eq!(
+            formatter.format_generic_app(&balloon, "", &[], &Config::fake_message()),
+            "*Game*\n\\# Title\nCaption\n   \\## second line\n#hashtag"
+        );
+
+        let music = MusicMessage {
+            url: None,
+            preview: None,
+            artist: None,
+            album: None,
+            track_name: Some("## track"),
+            lyrics: Some(vec!["# chorus", "verse"]),
+        };
+        assert_eq!(
+            formatter.format_music(&music),
+            "*Music*\nLyrics:\n\\# chorus\nverse\n\n\\## track"
+        );
+
+        // A link whose text is not a URL is written as is, then escaped.
+        let url = URLMessage {
+            title: None,
+            summary: None,
+            url: None,
+            original_url: None,
+            item_type: None,
+            images: vec![],
+            icons: vec![],
+            site_name: None,
+            placeholder: false,
+        };
+        let message = Config::fake_message_with_text("# not a link");
+        assert_eq!(
+            formatter.format_url(&message, &url),
+            "*Link*\n\\# not a link"
         );
     }
 
