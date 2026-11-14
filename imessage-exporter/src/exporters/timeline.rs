@@ -263,7 +263,7 @@ impl<'a> Timeline<'a> {
             current_message_row = msg.rowid;
 
             if msg.is_announcement() {
-                let block = self.format_announcement(&msg);
+                let block = self.format_announcement(&msg, Placement::OwnDay);
                 self.collect_message(&msg, block)?;
             } else if !msg.is_tapback() && !msg.is_poll_vote() && !msg.is_poll_update() {
                 // djf.7: as upstream's shared driver does for TXT and HTML,
@@ -689,7 +689,14 @@ impl<'a> Timeline<'a> {
             {
                 continue;
             }
-            let nested = self.format_message_block(reply, placement)?;
+            // djf.16 R3: a reply that was later unsent, or any other
+            // announcement, reads as one, as it does under its own day,
+            // instead of as an empty message block.
+            let nested = if reply.is_announcement() {
+                self.format_announcement(reply, placement)
+            } else {
+                self.format_message_block(reply, placement)?
+            };
             out.push_str(&blockquote(&nested));
             out.push('\n');
         }
@@ -723,8 +730,15 @@ impl<'a> Timeline<'a> {
     /// the TXT and HTML exports name. That includes events Messages shows
     /// with no actor (unattributed group events, unknown event rows, locations
     /// sent to emergency services), which get a sentence without a subject.
-    fn format_announcement(&self, msg: &Message) -> String {
-        let time = self.format_time_of_day(msg);
+    ///
+    /// Nested under the message it replies to (djf.16 R3), an announcement
+    /// shows its time the way a nested message block does (djf.12 F2): its
+    /// full date when it was sent on another day.
+    fn format_announcement(&self, msg: &Message, placement: Placement) -> String {
+        let time = match placement {
+            Placement::OwnDay => self.format_time_of_day(msg),
+            Placement::Nested { shown_on } => self.format_nested_time(msg, shown_on),
+        };
 
         let Some(resolved) = resolve_announcement(msg, self.config, YOU) else {
             return format!("*{time} — (unable to format announcement)*\n\n");
@@ -1580,7 +1594,7 @@ mod tests {
         message.is_from_me = true;
         message.item_type = 2;
 
-        let actual = exporter.format_announcement(&message);
+        let actual = exporter.format_announcement(&message, Placement::OwnDay);
         let expected = "*5:29:42 PM — You renamed the conversation to Hello world.*\n\n";
         assert_eq!(actual, expected);
     }
@@ -3071,6 +3085,76 @@ mod tests {
             format!(
                 "**5:29:45 PM — Me**\n\n*(reply to a message from Tue, May 17, 2022 5:29:42 PM)*\n\n{REPLY_WITH_A_REPLY_TEXT}\n\n> **5:29:46 PM — Me**\n>\n> {REPLY_TO_A_REPLY_TEXT}\n>\n\n"
             )
+        );
+    }
+
+    #[test]
+    fn unsent_reply_is_nested_as_an_announcement() {
+        // djf.16 R3: a reply that was later fully unsent was nested as a
+        // message block with a header and nothing under it.
+        let config = replies_config("unsent_reply_is_nested_as_an_announcement");
+        let exporter = Timeline::new(&config).unwrap();
+        let unsent = read_message(&config, UNSENT_REPLY_GUID);
+        assert!(unsent.is_announcement());
+
+        assert_eq!(
+            exporter
+                .format_timeline_message(&read_message(&config, REPLIES_PARENT_GUID))
+                .unwrap(),
+            format!(
+                "**5:29:42 PM — Me**\n\nparent\n\n\
+                 > *5:29:43 PM — You unsent a message!*\n>\n\n\
+                 > **5:29:44 PM — Me**\n>\n> {TWO_CHAT_REPLY_TEXT}\n>\n\n\
+                 > **5:29:45 PM — Me**\n>\n> {REPLY_WITH_A_REPLY_TEXT}\n>\n\n"
+            )
+        );
+
+        // Nested under a message from another day, it shows its full date,
+        // as a nested message block does (djf.12 F2).
+        let other_day = NaiveDate::from_ymd_opt(2022, 5, 16);
+        assert_eq!(
+            exporter.format_announcement(
+                &unsent,
+                Placement::Nested {
+                    shown_on: other_day
+                }
+            ),
+            "*Tue, May 17, 2022 5:29:43 PM — You unsent a message!*\n\n"
+        );
+    }
+
+    #[test]
+    fn export_nests_each_reply_once_and_leaves_no_empty_block() {
+        // djf.16 AC4: every reply whose parent was found is nested once,
+        // so nested headers equal the reply lines, and none is empty.
+        let mut options =
+            isolated_options("export_nests_each_reply_once_and_leaves_no_empty_block");
+        options.db_path = db_with_replies();
+        let export_path = options.export_path.clone();
+        let config = Config::fake_app(options);
+        let mut exporter = Timeline::new(&config).unwrap();
+        exporter.iter_messages().unwrap();
+        drop(exporter);
+        let contents = std::fs::read_to_string(export_path.join(TIMELINE_FILENAME)).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+
+        let nested_headers = lines.iter().filter(|line| line.starts_with("> **")).count();
+        let reply_lines = lines
+            .iter()
+            .filter(|line| line.starts_with("*(reply to a message from "))
+            .count();
+        assert_eq!((nested_headers, reply_lines), (3, 3), "got:\n{contents}");
+        let empty_blocks = lines
+            .windows(3)
+            .filter(|w| w[0].starts_with("> **") && w[1] == ">" && !w[2].starts_with("> "))
+            .count();
+        assert_eq!(empty_blocks, 0, "got:\n{contents}");
+        assert_eq!(
+            contents
+                .matches("> *5:29:43 PM — You unsent a message!*\n")
+                .count(),
+            1,
+            "got:\n{contents}"
         );
     }
 
