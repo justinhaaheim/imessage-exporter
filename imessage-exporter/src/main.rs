@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 mod app;
+mod db_access_hint;
 mod exporters;
 
 pub use exporters::{html::HTML, timeline::Timeline, txt::TXT};
@@ -25,17 +26,20 @@ fn main() -> ExitCode {
                 // Resolve the filtered contacts, if provided. A filter that matches no chat is an error: exit non-zero, export nothing.
                 if let Err(why) = app.resolve_filtered_handles() {
                     eprintln!("Unable to export: {why}");
+                    db_access_hint::eprint_db_access_hint(&why);
                     return ExitCode::FAILURE;
                 }
 
                 if let Err(why) = app.start() {
                     eprintln!("Unable to export: {why}");
+                    db_access_hint::eprint_db_access_hint(&why);
                     return ExitCode::FAILURE;
                 }
                 ExitCode::SUCCESS
             }
             Err(why) => {
                 eprintln!("Invalid configuration: {why}");
+                db_access_hint::eprint_db_access_hint(&why);
                 ExitCode::FAILURE
             }
         },
