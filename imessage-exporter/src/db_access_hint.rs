@@ -29,14 +29,21 @@ use crate::app::{
     options::{OPTION_PLATFORM, Options},
 };
 
-/// Copies the live database, with its `-wal` and `-shm` files, to a folder the user can read.
-/// `-m 700` creates the folder private to the user, so other local accounts cannot read the
-/// copy. It sets the mode only when it creates the folder; an existing `/tmp/imx` keeps its mode.
-const COPY_DB: &str = "mkdir -p -m 700 /tmp/imx && cp ~/Library/Messages/chat.db* /tmp/imx/";
+/// Copies the live database, with its `-wal` and `-shm` files, into a new folder.
+///
+/// `mktemp -d` makes a new folder every time, mode 700, so other local accounts cannot read the
+/// copy (djf.16 R1). A folder reused from an earlier copy could keep that copy's `-wal` and
+/// `-shm` files, and SQLite would apply that stale write-ahead log to the new copy, so the
+/// export would read the earlier database. A reused folder could also keep another owner's mode
+/// or be a planted symlink. The folder's path is kept in `D` for the export command, so both
+/// lines must run in the same shell ([`SAME_WINDOW`]).
+const COPY_DB: &str = r#"D=$(mktemp -d /tmp/imx.XXXXXX) && cp ~/Library/Messages/chat.db* "$D"/"#;
 /// Runs the export against that copy.
-const EXPORT_COPY: &str = "imessage-exporter -p /tmp/imx/chat.db <your other options>";
-/// The folder [`COPY_DB`] copies to, for a database at another path.
-const COPY_DIR: &str = "/tmp/imx";
+const EXPORT_COPY: &str = r#"imessage-exporter -p "$D"/chat.db <your other options>"#;
+/// The start of [`COPY_DB`] that makes the new folder, for a database at another path.
+const MAKE_COPY_DIR: &str = "D=$(mktemp -d /tmp/imx.XXXXXX)";
+/// Said before the two command lines, which share the folder path in `D`.
+const SAME_WINDOW: &str = "Run these two lines in the same terminal window.";
 
 /// What `main` knows about the Messages database the run was told to read, kept before
 /// `Config::new` takes the options.
@@ -140,7 +147,7 @@ fn db_access_hint(exe_path: Option<PathBuf>, failed: &FailedDb) -> String {
     };
     match copy_commands(failed) {
         Some((copy, export)) => format!(
-            "{add_binary}\nOr copy the database to a folder you can read and point at the copy:\n    {copy}\n    {export}"
+            "{add_binary}\nOr copy the database to a folder you can read and point at the copy:\n{SAME_WINDOW}\n    {copy}\n    {export}"
         ),
         None => add_binary,
     }
@@ -154,15 +161,11 @@ fn copy_commands(failed: &FailedDb) -> Option<(String, String)> {
         FailedDb::Other(path) => {
             let file_name = path.file_name()?.to_string_lossy();
             let source = path.to_string_lossy();
-            let copy = format!("{COPY_DIR}/{file_name}");
             Some((
+                format!("{MAKE_COPY_DIR} && cp {}* \"$D\"/", shell_quote(&source)),
                 format!(
-                    "mkdir -p -m 700 {COPY_DIR} && cp {}* {COPY_DIR}/",
-                    shell_quote(&source)
-                ),
-                format!(
-                    "imessage-exporter -p {} <your other options>",
-                    shell_quote(&copy)
+                    "imessage-exporter -p \"$D\"/{} <your other options>",
+                    shell_quote(&file_name)
                 ),
             ))
         }
@@ -204,8 +207,9 @@ mod tests {
     use crate::app::{error::RuntimeError, export_type::ExportType, options::Options};
 
     const COPY_LINE: &str =
-        "    mkdir -p -m 700 /tmp/imx && cp ~/Library/Messages/chat.db* /tmp/imx/";
-    const EXPORT_LINE: &str = "    imessage-exporter -p /tmp/imx/chat.db <your other options>";
+        r#"    D=$(mktemp -d /tmp/imx.XXXXXX) && cp ~/Library/Messages/chat.db* "$D"/"#;
+    const EXPORT_LINE: &str = r#"    imessage-exporter -p "$D"/chat.db <your other options>"#;
+    const SAME_WINDOW_LINE: &str = "Run these two lines in the same terminal window.";
     const DEFAULT_DB: &str = "/Users/someone/Library/Messages/chat.db";
 
     fn inaccessible(path: &str) -> RuntimeError {
@@ -240,10 +244,32 @@ mod tests {
         );
         assert!(hint.contains("System Settings > Privacy & Security > Full Disk Access"));
         assert!(hint.contains("cp ~/Library/Messages/chat.db*"));
-        assert!(hint.contains("-p /tmp/imx/chat.db"));
+        assert!(hint.contains(r#"-p "$D"/chat.db"#));
         assert!(hint.lines().any(|line| line == COPY_LINE));
         assert!(hint.lines().any(|line| line == EXPORT_LINE));
         assert!(!hint.contains("the imessage-exporter binary you ran"));
+    }
+
+    #[test]
+    fn copy_goes_to_a_new_private_folder_every_time() {
+        // djf.16 R1: a reused /tmp/imx kept an earlier copy's -wal and -shm, and SQLite
+        // applied that stale log to the new copy. mktemp -d makes a new folder, mode 700.
+        let hint = db_access_hint(None, &FailedDb::DefaultMacos);
+        assert!(hint.contains("mktemp -d /tmp/imx.XXXXXX"), "got:\n{hint}");
+        assert!(hint.contains(r#""$D"/"#), "got:\n{hint}");
+        assert!(
+            !hint.contains("/tmp/imx/"),
+            "hint reuses a fixed folder:\n{hint}"
+        );
+        assert!(!hint.contains("mkdir"), "got:\n{hint}");
+
+        // The same-window line comes right before the two command lines.
+        let lines: Vec<&str> = hint.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == SAME_WINDOW_LINE)
+            .unwrap_or_else(|| panic!("hint lacks the same-window line:\n{hint}"));
+        assert_eq!(lines[at + 1..], [COPY_LINE, EXPORT_LINE], "got:\n{hint}");
     }
 
     #[test]
@@ -252,7 +278,7 @@ mod tests {
 
         assert!(hint.contains("the imessage-exporter binary you ran"));
         assert!(hint.contains("cp ~/Library/Messages/chat.db*"));
-        assert!(hint.contains("-p /tmp/imx/chat.db"));
+        assert!(hint.contains(r#"-p "$D"/chat.db"#));
         // No line is left for a path: no line ends in the colon that would introduce one,
         // and no line is blank or only indentation.
         assert!(
@@ -304,14 +330,15 @@ mod tests {
         let hint = db_access_hint(None, &failed);
         assert!(
             hint.lines().any(|line| line
-                == "    mkdir -p -m 700 /tmp/imx && cp /Volumes/Archive/old-messages.db* /tmp/imx/"),
+                == r#"    D=$(mktemp -d /tmp/imx.XXXXXX) && cp /Volumes/Archive/old-messages.db* "$D"/"#),
             "hint does not copy the custom database:\n{hint}"
         );
         assert!(
             hint.lines().any(|line| line
-                == "    imessage-exporter -p /tmp/imx/old-messages.db <your other options>"),
+                == r#"    imessage-exporter -p "$D"/old-messages.db <your other options>"#),
             "hint does not export the copy:\n{hint}"
         );
+        assert!(hint.lines().any(|line| line == SAME_WINDOW_LINE));
         assert!(!hint.contains("~/Library/Messages"));
     }
 
@@ -322,10 +349,19 @@ mod tests {
         let hint = db_access_hint(None, &failed);
         assert!(
             hint.lines().any(|line| line
-                == "    mkdir -p -m 700 /tmp/imx && cp '/Users/someone/Old Mac/chat.db'* /tmp/imx/"),
+                == r#"    D=$(mktemp -d /tmp/imx.XXXXXX) && cp '/Users/someone/Old Mac/chat.db'* "$D"/"#),
             "hint does not quote the path:\n{hint}"
         );
         assert!(hint.lines().any(|line| line == EXPORT_LINE));
+
+        // The copy's own file name is quoted too.
+        let hint = db_access_hint(None, &FailedDb::Other(PathBuf::from("/data/it's.db")));
+        assert!(
+            hint.lines()
+                .any(|line| line
+                    == r#"    imessage-exporter -p "$D"/'it'\''s.db' <your other options>"#),
+            "hint does not quote the file name:\n{hint}"
+        );
 
         assert_eq!(shell_quote("/tmp/imx/chat.db"), "/tmp/imx/chat.db");
         assert_eq!(shell_quote("it's.db"), r"'it'\''s.db'");
