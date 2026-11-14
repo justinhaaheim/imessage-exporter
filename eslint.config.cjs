@@ -1,6 +1,7 @@
 const jhaConfig = require('eslint-config-jha-react-node/node');
 
 module.exports = [
-  {ignores: ['tmp/', 'dist/', '**/.claude/worktrees/']},
+  // target/ is Cargo's build output (git-ignored); `cargo doc` writes rustdoc JavaScript there.
+  {ignores: ['tmp/', 'dist/', 'target/', '**/.claude/worktrees/']},
   ...jhaConfig,
 ];
