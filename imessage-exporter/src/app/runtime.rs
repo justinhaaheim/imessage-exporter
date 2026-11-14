@@ -429,7 +429,8 @@ impl Config {
     }
 
     /// Resolve every `--conversation-with` group to the chat IDs whose
-    /// deduplicated non-self participant set matches the group exactly.
+    /// deduplicated non-self participant set matches the group exactly, plus
+    /// every other chat row of the same merged conversation.
     ///
     /// As a side effect, every raw handle id of every resolved participant is
     /// added to `included_handles` so diagnostic logging in
@@ -509,6 +510,22 @@ impl Config {
                 unmatched_groups.push(group_str.clone());
             }
         }
+
+        // djf.12 F5: upstream merges chat rows into one conversation (`chat_lookup` and
+        // shared participants, see `ChatToHandle::dedupe`) and exports them under one
+        // heading. Select every row of each matched conversation, including a row with
+        // other participants or none, so none of its messages go missing.
+        let matched_conversations: BTreeSet<i32> = included
+            .iter()
+            .filter_map(|chat_id| self.real_chatrooms.get(chat_id).copied())
+            .collect();
+        included.extend(
+            self.real_chatrooms
+                .iter()
+                .filter(|(_, conversation)| matched_conversations.contains(conversation))
+                .map(|(chat_id, _)| *chat_id),
+        );
+
         ExactMatches {
             chats: included,
             unmatched_groups,
@@ -1746,7 +1763,9 @@ mod directory_tests {
 
 #[cfg(test)]
 mod conversation_with_tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
+
+    use imessage_database::tables::chat_handle::ChatToHandle;
 
     use super::unmatched_group_warning;
     use crate::{
@@ -2032,6 +2051,35 @@ mod conversation_with_tests {
         assert_eq!(
             app.options.query_context.selected_chat_ids,
             Some(BTreeSet::from([1]))
+        );
+    }
+
+    #[test]
+    fn every_chat_row_of_a_matched_conversation_is_selected() {
+        // djf.12 F5. chat_lookup says chats 1, 5 and 6 are one conversation, which
+        // upstream exports under one heading. Chat 5 has no participant rows; chat 6
+        // holds handle 13, a different participant set. Only chat 1 matches
+        // `-w Alice` exactly, so 5 and 6 must come with it. `-w Bob` (chat 3) has no
+        // other rows, and the Alice+Bob conversations (2 and 4) stay out.
+        let mut app = fixture_with_three_people();
+        app.real_participants.insert(13, 13);
+        app.chatroom_participants.insert(6, BTreeSet::from([13]));
+        app.real_chatrooms = ChatToHandle::dedupe(
+            &app.chatroom_participants,
+            &HashMap::from([(5, 1), (6, 1)]),
+            &app.real_participants,
+            &app.chatrooms,
+        );
+        let alice_conversation = app.real_chatrooms[&1];
+        assert_eq!(app.real_chatrooms[&5], alice_conversation);
+        assert_eq!(app.real_chatrooms[&6], alice_conversation);
+
+        app.options.conversation_with = vec![String::from("Alice"), String::from("Bob")];
+        app.resolve_filtered_handles().unwrap();
+
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([1, 3, 5, 6]))
         );
     }
 
