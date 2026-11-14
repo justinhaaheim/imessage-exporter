@@ -14,7 +14,9 @@
  words (`"<app> message:"`, `" transaction:"`, `"Photo album:"`), so those
  words are not repeated. Field text is written as parsed, the same way the
  timeline writes message text, with one exception: a line that Markdown
- would read as a heading gets a backslash before its first `#` (djf.9).
+ would read as a heading, a code fence or an HTML block gets a backslash
+ before its first marker character (djf.9, djf.12 F1; see
+ [`escape_block_starts`](crate::exporters::timeline::escape_block_starts)).
 */
 
 use std::borrow::Cow;
@@ -37,7 +39,7 @@ use crate::{
             balloon::{dispatch_app_balloon, resolve_check_in_footer},
             text::OptionalText,
         },
-        timeline::escape_heading_lines,
+        timeline::{escape_block_starts_after, is_blank_line},
     },
 };
 
@@ -269,9 +271,14 @@ impl Balloon {
     }
 
     /// Append `text` as its own line, escaping any line of it that would read
-    /// as a Markdown heading (djf.9).
+    /// as a Markdown heading or open a code fence or an HTML block (djf.9,
+    /// djf.12 F1). Each line sits directly under the one before it, so a
+    /// first line of only `=` or `-` under a line that is not blank would
+    /// make that line a heading, and is escaped too.
     fn line(&mut self, text: &str) -> &mut Self {
-        self.raw_line(&escape_heading_lines(text))
+        let last_line = self.0.rsplit(['\n', '\r']).next().unwrap_or_default();
+        let escaped = escape_block_starts_after(text, !is_blank_line(last_line));
+        self.raw_line(&escaped)
     }
 
     /// Append `text` as its own line, unchanged. For lines inside a fenced
@@ -865,6 +872,42 @@ mod tests {
         assert_eq!(
             formatter.format_url(&message, &url),
             "*Link*\n\\# not a link"
+        );
+    }
+
+    #[test]
+    fn block_starting_field_lines_are_escaped() {
+        // djf.12 F1: a field that opens a fence or an HTML block, or that
+        // underlines the line above it, is escaped too.
+        let config = config();
+        let formatter = TimelineBalloons { config: &config };
+
+        let mut balloon = empty_app_message();
+        balloon.app_name = Some("Game");
+        // Directly under the label line, so it would make the label a heading.
+        balloon.title = Some("===");
+        balloon.subtitle = Some("```");
+        balloon.caption = Some("<!-- note");
+        balloon.subcaption = Some("Total\n---");
+        balloon.trailing_caption = Some("~~~ x");
+        assert_eq!(
+            formatter.format_generic_app(&balloon, "", &[], &Config::fake_message()),
+            "*Game*\n\\===\n\\```\n\\<!-- note\nTotal\n\\---\n\\~~~ x"
+        );
+
+        // After the blank line that ends the lyrics, a line of dashes is a
+        // rule, not an underline, so it is left alone.
+        let music = MusicMessage {
+            url: None,
+            preview: None,
+            artist: None,
+            album: None,
+            track_name: Some("---"),
+            lyrics: Some(vec!["verse", "==="]),
+        };
+        assert_eq!(
+            formatter.format_music(&music),
+            "*Music*\nLyrics:\nverse\n\\===\n\n---"
         );
     }
 

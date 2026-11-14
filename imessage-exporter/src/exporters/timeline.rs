@@ -369,7 +369,7 @@ impl<'a> Timeline<'a> {
         if let Some(subject) = &msg.subject
             && !subject.is_empty()
         {
-            let subject = escape_heading_lines(subject);
+            let subject = escape_block_starts(subject);
             let _ = writeln!(out, "*Subject:* {subject}");
             out.push('\n');
         }
@@ -407,8 +407,9 @@ impl<'a> Timeline<'a> {
                             rewrite_fitness_receiver(slice_text_for_bubble(text, &text_ranges));
                         let trimmed = slice.trim();
                         if !trimmed.is_empty() {
-                            // djf.9: no line of the text may read as a heading.
-                            let trimmed = escape_heading_lines(trimmed);
+                            // djf.9, djf.12 F1: no line of the text may read
+                            // as a heading or open a fence or HTML block.
+                            let trimmed = escape_block_starts(trimmed);
                             if edited {
                                 let _ = writeln!(out, "{trimmed} {EDITED_MARKER}");
                                 marked_edited = true;
@@ -470,7 +471,7 @@ impl<'a> Timeline<'a> {
         if !wrote_body && let Some(text) = &msg.text {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                let trimmed = escape_heading_lines(trimmed);
+                let trimmed = escape_block_starts(trimmed);
                 let _ = writeln!(out, "{trimmed}");
                 out.push('\n');
             }
@@ -745,36 +746,72 @@ fn app_message_fallback(msg: &Message) -> String {
                 .all(|c| c == OBJECT_REPLACEMENT_CHAR || c.is_whitespace())
         })
         .unwrap_or(APP_MESSAGE_PLACEHOLDER);
-    // djf.9: a later line of a multi-line text could read as a heading.
-    format!("*{}*", escape_heading_lines(label))
+    // djf.9, djf.12 F1: a later line of a multi-line text could read as a
+    // heading or open a fence or HTML block.
+    format!("*{}*", escape_block_starts(label))
 }
 
-/// Escape every line of `text` that CommonMark would read as an ATX heading
-/// (djf.9), so message text never looks like a day or thread heading.
+/// Escape every line of `text` that CommonMark would read as the start of a
+/// heading, a code fence or an HTML block, so message text never looks like
+/// a day or thread heading and never hides the messages after it (djf.9,
+/// djf.12 F1).
 ///
-/// A heading line is up to three spaces, then one to six `#`, then a space,
-/// a tab or the end of the line. A backslash goes before its first `#`, which
-/// Markdown renders as a plain `#`. Hashtags such as `#blessed` (no space
-/// after the `#`), seven or more `#`, and lines indented four or more spaces
-/// are left alone, because none of them is a heading. Lines end at `\n` or
-/// `\r`, as in CommonMark. Escaping an escaped line changes nothing.
-pub(crate) fn escape_heading_lines(text: &str) -> Cow<'_, str> {
+/// A backslash goes before the line's first marker character, which Markdown
+/// renders as that plain character. A line is escaped when, after up to three
+/// spaces, it is:
+///
+/// - an ATX heading: one to six `#`, then a space, a tab or the end of the
+///   line. Hashtags such as `#blessed` and seven or more `#` are not headings;
+/// - a code fence: three or more `` ` `` with no `` ` `` later on the line,
+///   or three or more `~`. Left open, a fence turns the rest of the file into
+///   code;
+/// - an HTML block of CommonMark types 1 to 5, which runs to its own end
+///   marker rather than to the next blank line, so it too can swallow the
+///   rest of the file: `<pre`, `<script`, `<style` or `<textarea` (any case,
+///   then a space, a tab, `>` or the end of the line), `<!--`, `<?`, `<!` and
+///   a letter, or `<![CDATA[`;
+/// - a setext heading underline (djf.11): only `=` or only `-`, then only
+///   spaces or tabs, directly under a line that is not blank. A line of `-`
+///   under a blank line is a horizontal rule, not a heading, and is left
+///   alone.
+///
+/// The first line of `text` counts as following a blank line, as message
+/// text does in the timeline; [`escape_block_starts_after`] takes the
+/// other case. Lines indented four or more spaces, or by a tab, are code and
+/// are left alone. Lines end at `\r\n`, `\n` or `\r`, as in CommonMark.
+/// Escaping an escaped text changes nothing.
+pub(crate) fn escape_block_starts(text: &str) -> Cow<'_, str> {
+    escape_block_starts_after(text, false)
+}
+
+/// [`escape_block_starts`], where `follows_text` says whether the line just
+/// before `text` (outside it) is a line that is not blank, which makes a
+/// first line of only `=` or `-` a setext heading underline.
+pub(crate) fn escape_block_starts_after(text: &str, follows_text: bool) -> Cow<'_, str> {
     let mut escaped: Option<String> = None;
     let mut copied = 0;
     let mut line_start = 0;
+    let mut previous_blank = !follows_text;
     loop {
         let rest = &text[line_start..];
-        if let Some(indent) = heading_marker_indent(rest) {
-            let hash_at = line_start + indent;
+        let (line_len, ending_len) = match rest.find(['\n', '\r']) {
+            Some(end) if rest[end..].starts_with("\r\n") => (end, 2),
+            Some(end) => (end, 1),
+            None => (rest.len(), 0),
+        };
+        let line = &rest[..line_len];
+        if let Some(indent) = block_start_indent(line, previous_blank) {
+            let marker_at = line_start + indent;
             let out = escaped.get_or_insert_with(|| String::with_capacity(text.len() + 8));
-            out.push_str(&text[copied..hash_at]);
+            out.push_str(&text[copied..marker_at]);
             out.push('\\');
-            copied = hash_at;
+            copied = marker_at;
         }
-        match rest.find(['\n', '\r']) {
-            Some(end) => line_start += end + 1,
-            None => break,
+        previous_blank = is_blank_line(line);
+        if ending_len == 0 {
+            break;
         }
+        line_start += line_len + ending_len;
     }
     match escaped {
         Some(mut out) => {
@@ -785,22 +822,70 @@ pub(crate) fn escape_heading_lines(text: &str) -> Cow<'_, str> {
     }
 }
 
-/// The number of leading spaces when `line` starts with an ATX heading
-/// marker, else `None`. `line` may run past its own line ending.
-fn heading_marker_indent(line: &str) -> Option<usize> {
+/// `true` when `line` (without its line ending) is empty or only spaces and
+/// tabs, which is what CommonMark calls a blank line.
+pub(crate) fn is_blank_line(line: &str) -> bool {
+    line.bytes().all(|b| b == b' ' || b == b'\t')
+}
+
+/// The number of leading spaces when `line` (without its line ending) starts
+/// one of the blocks [`escape_block_starts`] escapes, else `None`.
+/// `previous_blank` says whether the line before it is blank.
+fn block_start_indent(line: &str, previous_blank: bool) -> Option<usize> {
     let indent = line.bytes().take_while(|&b| b == b' ').count();
     if indent > 3 {
         return None;
     }
-    let after_indent = &line.as_bytes()[indent..];
-    let hashes = after_indent.iter().take_while(|&&b| b == b'#').count();
-    if !(1..=6).contains(&hashes) {
-        return None;
+    let marker = &line.as_bytes()[indent..];
+    let starts_block = is_atx_heading(marker)
+        || is_code_fence(marker)
+        || is_html_block(marker)
+        || (!previous_blank && is_setext_underline(marker));
+    starts_block.then_some(indent)
+}
+
+/// One to six `#`, then a space, a tab or the end of the line.
+fn is_atx_heading(marker: &[u8]) -> bool {
+    let hashes = marker.iter().take_while(|&&b| b == b'#').count();
+    (1..=6).contains(&hashes) && matches!(marker.get(hashes), None | Some(b' ' | b'\t'))
+}
+
+/// Three or more `` ` `` with no `` ` `` after them, or three or more `~`.
+fn is_code_fence(marker: &[u8]) -> bool {
+    let Some(&fence) = marker.first().filter(|&&b| b == b'`' || b == b'~') else {
+        return false;
+    };
+    let run = marker.iter().take_while(|&&b| b == fence).count();
+    run >= 3 && (fence == b'~' || !marker[run..].contains(&b'`'))
+}
+
+/// The start of an HTML block of CommonMark types 1 to 5.
+fn is_html_block(marker: &[u8]) -> bool {
+    let Some(rest) = marker.strip_prefix(b"<") else {
+        return false;
+    };
+    if rest.starts_with(b"!--") || rest.starts_with(b"?") || rest.starts_with(b"![CDATA[") {
+        return true;
     }
-    match after_indent.get(hashes) {
-        None | Some(b' ' | b'\t' | b'\n' | b'\r') => Some(indent),
-        Some(_) => None,
+    if rest.first() == Some(&b'!') && rest.get(1).is_some_and(u8::is_ascii_alphabetic) {
+        return true;
     }
+    [&b"pre"[..], b"script", b"style", b"textarea"]
+        .iter()
+        .any(|tag| {
+            rest.get(..tag.len())
+                .is_some_and(|name| name.eq_ignore_ascii_case(tag))
+                && matches!(rest.get(tag.len()), None | Some(b' ' | b'\t' | b'>'))
+        })
+}
+
+/// Only `=` or only `-`, then only spaces or tabs.
+fn is_setext_underline(marker: &[u8]) -> bool {
+    let Some(&underline) = marker.first().filter(|&&b| b == b'=' || b == b'-') else {
+        return false;
+    };
+    let run = marker.iter().take_while(|&&b| b == underline).count();
+    marker[run..].iter().all(|&b| b == b' ' || b == b'\t')
 }
 
 /// Prefix every line of `text` with `> ` for a Markdown blockquote.
@@ -1792,9 +1877,9 @@ mod tests {
         assert_eq!(message_headers, 3, "got:\n{contents}");
     }
 
-    // MARK: Heading escape (djf.9)
+    // MARK: Block-start escape (djf.9, djf.12 F1)
     #[test]
-    fn escape_heading_lines_escapes_only_atx_headings() {
+    fn escape_block_starts_escapes_atx_headings() {
         for (input, expected) in [
             ("# hi", "\\# hi"),
             ("## hi", "\\## hi"),
@@ -1817,15 +1902,129 @@ mod tests {
             ("intro\r\n# one\r# two", "intro\r\n\\# one\r\\# two"),
             ("# trailing\n", "\\# trailing\n"),
         ] {
-            assert_eq!(escape_heading_lines(input), expected, "input {input:?}");
+            assert_eq!(escape_block_starts(input), expected, "input {input:?}");
         }
     }
 
     #[test]
-    fn escape_heading_lines_is_idempotent_and_borrows_when_unchanged() {
-        let once = escape_heading_lines("# a\n   ## b").into_owned();
-        assert_eq!(escape_heading_lines(&once), once);
-        assert!(matches!(escape_heading_lines("#blessed"), Cow::Borrowed(_)));
+    fn escape_block_starts_escapes_code_fences() {
+        for (input, expected) in [
+            ("```", "\\```"),
+            ("```rust", "\\```rust"),
+            ("````", "\\````"),
+            ("~~~", "\\~~~"),
+            ("~~~ info with ` ticks", "\\~~~ info with ` ticks"),
+            ("   ```", "   \\```"),
+            (
+                "here is the start of some code:\n```\nlet x = 1;",
+                "here is the start of some code:\n\\```\nlet x = 1;",
+            ),
+            // Not fences: left alone.
+            ("``", "``"),
+            ("~~", "~~"),
+            ("```inline``` code", "```inline``` code"),
+            ("    ```", "    ```"),
+            ("\t```", "\t```"),
+            ("a ``` in the middle", "a ``` in the middle"),
+        ] {
+            assert_eq!(escape_block_starts(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn escape_block_starts_escapes_html_blocks_that_run_to_an_end_marker() {
+        for (input, expected) in [
+            // Types 1 to 5.
+            ("<pre", "\\<pre"),
+            ("<PRE>", "\\<PRE>"),
+            ("<script src=x>", "\\<script src=x>"),
+            ("<style\tx", "\\<style\tx"),
+            ("<textarea>", "\\<textarea>"),
+            ("<!-- note", "\\<!-- note"),
+            ("<?php echo 1;", "\\<?php echo 1;"),
+            ("<!DOCTYPE html>", "\\<!DOCTYPE html>"),
+            ("<![CDATA[x", "\\<![CDATA[x"),
+            ("  <!-- note", "  \\<!-- note"),
+            ("intro\n<!-- note", "intro\n\\<!-- note"),
+            // Other HTML ends at the next blank line, so it is left alone.
+            ("<div>", "<div>"),
+            ("<prefix", "<prefix"),
+            ("<a href=\"x\">", "<a href=\"x\">"),
+            ("<!-", "<!-"),
+            ("<!1", "<!1"),
+            ("    <!-- code", "    <!-- code"),
+            ("a <!-- in the middle", "a <!-- in the middle"),
+        ] {
+            assert_eq!(escape_block_starts(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn escape_block_starts_escapes_setext_underlines_under_text() {
+        // djf.11: a line of only `=` or `-` under a line of text makes that
+        // line a heading.
+        for (input, expected) in [
+            ("Total\n-----", "Total\n\\-----"),
+            ("Total\n===", "Total\n\\==="),
+            ("Results\n===\ndone", "Results\n\\===\ndone"),
+            ("Total\n-", "Total\n\\-"),
+            ("Total\n   ===  ", "Total\n   \\===  "),
+            ("Total\r\n===", "Total\r\n\\==="),
+            ("a\n===\n===", "a\n\\===\n\\==="),
+            // Under a blank line or at the start: a rule or text, left alone.
+            ("Total\n\n-----", "Total\n\n-----"),
+            ("Total\n  \t\n===", "Total\n  \t\n==="),
+            ("---", "---"),
+            ("===\nmore", "===\nmore"),
+            // Not underlines: left alone.
+            ("Total\n= =", "Total\n= ="),
+            ("Total\n=-=", "Total\n=-="),
+            ("Total\n    ===", "Total\n    ==="),
+            ("Total\n--- x", "Total\n--- x"),
+        ] {
+            assert_eq!(escape_block_starts(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn escape_block_starts_after_text_escapes_a_first_underline_line() {
+        assert_eq!(escape_block_starts_after("===", true), "\\===");
+        assert_eq!(escape_block_starts_after("---\nx", true), "\\---\nx");
+        assert_eq!(escape_block_starts_after("===", false), "===");
+    }
+
+    #[test]
+    fn escape_block_starts_is_idempotent_and_borrows_when_unchanged() {
+        let once = escape_block_starts("# a\n   ## b\n```\n<!-- c\nd\n===").into_owned();
+        assert_eq!(once, "\\# a\n   \\## b\n\\```\n\\<!-- c\nd\n\\===");
+        assert_eq!(escape_block_starts(&once), once);
+        assert!(matches!(escape_block_starts("#blessed"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn block_starting_message_lines_are_escaped() {
+        // djf.12 F1: an unclosed fence, an HTML comment and a setext
+        // underline each used to restyle or swallow what came after them.
+        let config = Config::fake_app(isolated_options("block_starting_message_lines_are_escaped"));
+        let exporter = Timeline::new(&config).unwrap();
+
+        for (text, expected_body) in [
+            (
+                "here is the start of some code:\n```\nlet x = 1;",
+                "here is the start of some code:\n\\```\nlet x = 1;",
+            ),
+            ("<!-- note", "\\<!-- note"),
+            ("Results\n===\ndone", "Results\n\\===\ndone"),
+        ] {
+            let mut message = Config::fake_message_with_text(text);
+            message.date = SAMPLE_DATE;
+            message.is_from_me = true;
+            assert_eq!(
+                exporter.format_timeline_message(&message).unwrap(),
+                format!("**5:29:42 PM — Me**\n\n{expected_body}\n\n"),
+                "text {text:?}"
+            );
+        }
     }
 
     #[test]
