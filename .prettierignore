@@ -29,3 +29,11 @@ coverage
 
 # CLAUDE.md is managed by Claude Code, not prettier
 **/CLAUDE.md
+
+# Upstream-owned paths (ReagentX/imessage-exporter). This fork merges upstream regularly, so these files must keep upstream's exact text: reformatting them turns every upstream sync into a conflict.
+# Fork-owned files inside these paths (the timeline exporter, its README section, .github/workflows/signal.yml) are skipped too; that is the accepted cost.
+/imessage-database/
+/imessage-exporter/
+/docs/
+/README.md
+/.github/
