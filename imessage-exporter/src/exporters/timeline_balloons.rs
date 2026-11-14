@@ -271,8 +271,10 @@ impl Balloon {
     }
 
     /// Append `text` as its own line, escaping any line of it that would read
-    /// as a Markdown heading or open a code fence or an HTML block (djf.9,
-    /// djf.12 F1). Each line sits directly under the one before it, so a
+    /// as a Markdown heading or open a code fence that `text` does not close
+    /// or an HTML block (djf.9, djf.12 F1, djf.16 R2). `text` gets no prefix
+    /// or suffix, so a fence it closes stays closed. Each line sits directly
+    /// under the one before it, so a
     /// first line of only `=` or `-` under a line that is not blank would
     /// make that line a heading, and is escaped too.
     fn line(&mut self, text: &str) -> &mut Self {

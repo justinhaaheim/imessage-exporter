@@ -514,7 +514,8 @@ impl<'a> Timeline<'a> {
         if let Some(subject) = &msg.subject
             && !subject.is_empty()
         {
-            let subject = escape_block_starts(subject);
+            // djf.16 R2: the subject follows a label on its first line.
+            let subject = escape_wrapped_block_starts(subject);
             let _ = writeln!(out, "*Subject:* {subject}");
             out.push('\n');
         }
@@ -560,7 +561,14 @@ impl<'a> Timeline<'a> {
                             // as a heading or open a fence or HTML block.
                             let trimmed = escape_block_starts(trimmed);
                             if edited {
-                                let _ = writeln!(out, "{trimmed} {EDITED_MARKER}");
+                                // djf.16 R2: a closing fence stops closing
+                                // with the marker after it on its line.
+                                let gap = if ends_with_code_fence(&trimmed) {
+                                    '\n'
+                                } else {
+                                    ' '
+                                };
+                                let _ = writeln!(out, "{trimmed}{gap}{EDITED_MARKER}");
                                 marked_edited = true;
                             } else {
                                 let _ = writeln!(out, "{trimmed}");
@@ -920,8 +928,9 @@ fn app_message_fallback(msg: &Message) -> String {
         })
         .unwrap_or(APP_MESSAGE_PLACEHOLDER);
     // djf.9, djf.12 F1: a later line of a multi-line text could read as a
-    // heading or open a fence or HTML block.
-    format!("*{}*", escape_block_starts(label))
+    // heading or open a fence or HTML block. djf.16 R2: the `*` around the
+    // text would keep a closing fence from closing, so every fence is escaped.
+    format!("*{}*", escape_wrapped_block_starts(label))
 }
 
 /// Escape every line of `text` that CommonMark would read as the start of a
@@ -935,9 +944,13 @@ fn app_message_fallback(msg: &Message) -> String {
 ///
 /// - an ATX heading: one to six `#`, then a space, a tab or the end of the
 ///   line. Hashtags such as `#blessed` and seven or more `#` are not headings;
-/// - a code fence: three or more `` ` `` with no `` ` `` later on the line,
-///   or three or more `~`. Left open, a fence turns the rest of the file into
-///   code;
+/// - a code fence that no later line of `text` closes: three or more `` ` ``
+///   with no `` ` `` later on the line, or three or more `~`. Left open, a
+///   fence turns the rest of the file into code. A fence that a later line
+///   closes (the same character, at least as many of it, after up to three
+///   spaces, then only spaces) is left as it is, with every line inside it
+///   and its closing line, so a code block keeps rendering as code
+///   (djf.16 R2);
 /// - an HTML block of CommonMark types 1 to 5, which runs to its own end
 ///   marker rather than to the next blank line, so it too can swallow the
 ///   rest of the file: `<pre`, `<script`, `<style` or `<textarea` (any case,
@@ -953,6 +966,11 @@ fn app_message_fallback(msg: &Message) -> String {
 /// other case. Lines indented four or more spaces, or by a tab, are code and
 /// are left alone. Lines end at `\r\n`, `\n` or `\r`, as in CommonMark.
 /// Escaping an escaped text changes nothing.
+///
+/// `text` must stand on lines of its own in the output, with nothing added
+/// before its first line or after its last, because a closing fence with
+/// anything after it no longer closes. Text that is placed after a prefix or
+/// before a suffix goes through [`escape_wrapped_block_starts`] instead.
 pub(crate) fn escape_block_starts(text: &str) -> Cow<'_, str> {
     escape_block_starts_after(text, false)
 }
@@ -961,18 +979,57 @@ pub(crate) fn escape_block_starts(text: &str) -> Cow<'_, str> {
 /// before `text` (outside it) is a line that is not blank, which makes a
 /// first line of only `=` or `-` a setext heading underline.
 pub(crate) fn escape_block_starts_after(text: &str, follows_text: bool) -> Cow<'_, str> {
+    escape_lines(text, follows_text, Fences::KeepClosed)
+}
+
+/// [`escape_block_starts`] for text whose first line follows a prefix or
+/// whose last line has a suffix in the output, such as `*Subject:* ` or the
+/// `*` around italic text. A fence that the text closes may not close once
+/// the suffix is added, so every code fence line is escaped (djf.16 R2).
+pub(crate) fn escape_wrapped_block_starts(text: &str) -> Cow<'_, str> {
+    escape_lines(text, false, Fences::EscapeAll)
+}
+
+/// Which code fence lines [`escape_lines`] escapes (djf.16 R2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fences {
+    /// Only a fence that no later line of the text closes. A closed fence,
+    /// its contents and its closing line are left as they are.
+    KeepClosed,
+    /// Every code fence line.
+    EscapeAll,
+}
+
+/// The code fence a line opens: its character and how many of it.
+#[derive(Clone, Copy)]
+struct Fence {
+    marker: u8,
+    len: usize,
+}
+
+/// The escape pass behind [`escape_block_starts_after`] and
+/// [`escape_wrapped_block_starts`].
+fn escape_lines(text: &str, follows_text: bool, fences: Fences) -> Cow<'_, str> {
+    let lines = split_lines(text);
     let mut escaped: Option<String> = None;
     let mut copied = 0;
-    let mut line_start = 0;
+    // Whether no paragraph line comes right before this line, so a line of
+    // only `=` or `-` cannot underline it.
     let mut previous_blank = !follows_text;
-    loop {
-        let rest = &text[line_start..];
-        let (line_len, ending_len) = match rest.find(['\n', '\r']) {
-            Some(end) if rest[end..].starts_with("\r\n") => (end, 2),
-            Some(end) => (end, 1),
-            None => (rest.len(), 0),
-        };
-        let line = &rest[..line_len];
+    let mut index = 0;
+    while let Some(&(line_start, line)) = lines.get(index) {
+        if fences == Fences::KeepClosed
+            && let Some(fence) = opening_fence(line)
+            && let Some(closing) = lines[index + 1..]
+                .iter()
+                .position(|&(_, later)| closes_fence(later, fence))
+        {
+            // Skip the fence, its contents and its closing line. No
+            // paragraph continues after a closed fence.
+            index += closing + 2;
+            previous_blank = true;
+            continue;
+        }
         if let Some(indent) = block_start_indent(line, previous_blank) {
             let marker_at = line_start + indent;
             let out = escaped.get_or_insert_with(|| String::with_capacity(text.len() + 8));
@@ -981,10 +1038,7 @@ pub(crate) fn escape_block_starts_after(text: &str, follows_text: bool) -> Cow<'
             copied = marker_at;
         }
         previous_blank = is_blank_line(line);
-        if ending_len == 0 {
-            break;
-        }
-        line_start += line_len + ending_len;
+        index += 1;
     }
     match escaped {
         Some(mut out) => {
@@ -993,6 +1047,57 @@ pub(crate) fn escape_block_starts_after(text: &str, follows_text: bool) -> Cow<'
         }
         None => Cow::Borrowed(text),
     }
+}
+
+/// Each line of `text` without its line ending, with the byte offset where
+/// it starts. Lines end at `\r\n`, `\n` or `\r`. Text that ends with a line
+/// ending has an empty last line.
+fn split_lines(text: &str) -> Vec<(usize, &str)> {
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    loop {
+        let rest = &text[line_start..];
+        let (line_len, ending_len) = match rest.find(['\n', '\r']) {
+            Some(end) if rest[end..].starts_with("\r\n") => (end, 2),
+            Some(end) => (end, 1),
+            None => (rest.len(), 0),
+        };
+        lines.push((line_start, &rest[..line_len]));
+        if ending_len == 0 {
+            return lines;
+        }
+        line_start += line_len + ending_len;
+    }
+}
+
+/// The fence `line` opens when, after up to three spaces, it is a code fence.
+fn opening_fence(line: &str) -> Option<Fence> {
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    code_fence(&line.as_bytes()[indent..])
+}
+
+/// `true` when `line` closes `fence`: after up to three spaces, at least
+/// `fence.len` of its character, then only spaces.
+fn closes_fence(line: &str, fence: Fence) -> bool {
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let marker = &line.as_bytes()[indent..];
+    let run = marker.iter().take_while(|&&b| b == fence.marker).count();
+    run >= fence.len && marker[run..].iter().all(|&b| b == b' ')
+}
+
+/// `true` when the last line of `text` is a code fence line. In text from
+/// [`escape_block_starts`], such a line closes a fence, and stops closing it
+/// if anything is written after it on the same line (djf.16 R2).
+fn ends_with_code_fence(text: &str) -> bool {
+    split_lines(text)
+        .last()
+        .is_some_and(|&(_, line)| opening_fence(line).is_some())
 }
 
 /// `true` when `line` (without its line ending) is empty or only spaces and
@@ -1011,7 +1116,7 @@ fn block_start_indent(line: &str, previous_blank: bool) -> Option<usize> {
     }
     let marker = &line.as_bytes()[indent..];
     let starts_block = is_atx_heading(marker)
-        || is_code_fence(marker)
+        || code_fence(marker).is_some()
         || is_html_block(marker)
         || (!previous_blank && is_setext_underline(marker));
     starts_block.then_some(indent)
@@ -1023,13 +1128,15 @@ fn is_atx_heading(marker: &[u8]) -> bool {
     (1..=6).contains(&hashes) && matches!(marker.get(hashes), None | Some(b' ' | b'\t'))
 }
 
-/// Three or more `` ` `` with no `` ` `` after them, or three or more `~`.
-fn is_code_fence(marker: &[u8]) -> bool {
-    let Some(&fence) = marker.first().filter(|&&b| b == b'`' || b == b'~') else {
-        return false;
-    };
+/// The fence `marker` opens when it is three or more `` ` `` with no `` ` ``
+/// after them, or three or more `~`.
+fn code_fence(marker: &[u8]) -> Option<Fence> {
+    let &fence = marker.first().filter(|&&b| b == b'`' || b == b'~')?;
     let run = marker.iter().take_while(|&&b| b == fence).count();
-    run >= 3 && (fence == b'~' || !marker[run..].contains(&b'`'))
+    (run >= 3 && (fence == b'~' || !marker[run..].contains(&b'`'))).then_some(Fence {
+        marker: fence,
+        len: run,
+    })
 }
 
 /// The start of an HTML block of CommonMark types 1 to 5.
@@ -2554,6 +2661,128 @@ mod tests {
         assert_eq!(once, "\\# a\n   \\## b\n\\```\n\\<!-- c\nd\n\\===");
         assert_eq!(escape_block_starts(&once), once);
         assert!(matches!(escape_block_starts("#blessed"), Cow::Borrowed(_)));
+
+        let mixed = "```\n# kept\n```\n# a\n````\nb\n```";
+        let once = escape_block_starts(mixed).into_owned();
+        assert_eq!(once, "```\n# kept\n```\n\\# a\n\\````\nb\n\\```");
+        assert_eq!(escape_block_starts(&once), once);
+    }
+
+    #[test]
+    fn escape_block_starts_keeps_a_fence_the_text_closes() {
+        // djf.16 R2: escaping a fence that a later line closes turned a code
+        // block into a paragraph and lost characters (`Vec<String>` read as
+        // `Vec`, `a*b*c` as `abc`). A closed fence, everything inside it and
+        // its closing line are left as they are.
+        for text in [
+            "```\nlet v: Vec<String> = a*b*c;\n```",
+            "look:\n```rust\nfn main() {}\n```",
+            // Nothing inside the fence is escaped, not even block starts.
+            "```\n# not a heading\n<!-- not html\nTitle\n===\n```",
+            "~~~\ncode\n~~~",
+            // The closing fence may be longer, indented up to three spaces
+            // and followed by spaces.
+            "```\ncode\n`````",
+            "  ~~~\ncode\n   ~~~  ",
+            "```\ncode\n```\r\nafter",
+            // After a closed fence no paragraph continues, so a line of `-`
+            // is a rule and a line of `=` is text.
+            "```\ncode\n```\n---",
+            "```\ncode\n```\n===",
+        ] {
+            assert_eq!(escape_block_starts(text), text, "text {text:?}");
+            assert!(
+                matches!(escape_block_starts(text), Cow::Borrowed(_)),
+                "text {text:?}"
+            );
+        }
+        // Escaping goes on after a closed fence.
+        for (input, expected) in [
+            (
+                "```\ncode\n```\nafter\n# heading",
+                "```\ncode\n```\nafter\n\\# heading",
+            ),
+            ("```\na\n```\n```\nb", "```\na\n```\n\\```\nb"),
+            ("# a\n```\nb\n```", "\\# a\n```\nb\n```"),
+        ] {
+            assert_eq!(escape_block_starts(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn escape_block_starts_escapes_a_fence_no_later_line_closes() {
+        for (input, expected) in [
+            // Shorter, or the other character: not a closing fence. The
+            // line then opens a fence of its own, which nothing closes.
+            ("````\ncode\n```", "\\````\ncode\n\\```"),
+            ("```\ncode\n~~~", "\\```\ncode\n\\~~~"),
+            // Text or a tab after the fence characters: not a closing fence.
+            ("```\ncode\n``` x", "\\```\ncode\n\\``` x"),
+            ("```\ncode\n```\t", "\\```\ncode\n\\```\t"),
+            // Four spaces: code, so neither a closing nor an opening fence.
+            ("```\ncode\n    ```", "\\```\ncode\n    ```"),
+            // A closing fence must come after the opening line.
+            ("```", "\\```"),
+        ] {
+            assert_eq!(escape_block_starts(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn escape_wrapped_block_starts_escapes_every_fence() {
+        // Text after a prefix or before a suffix: a closing fence with the
+        // suffix after it would not close, so every fence is escaped.
+        assert_eq!(
+            escape_wrapped_block_starts("```\ncode\n```"),
+            "\\```\ncode\n\\```"
+        );
+        assert_eq!(
+            escape_wrapped_block_starts("a\n# b\n~~~"),
+            "a\n\\# b\n\\~~~"
+        );
+    }
+
+    #[test]
+    fn closed_fence_in_a_message_stays_a_code_block() {
+        let config = Config::fake_app(isolated_options(
+            "closed_fence_in_a_message_stays_a_code_block",
+        ));
+        let exporter = Timeline::new(&config).unwrap();
+
+        let text = "try this:\n```\nlet v: Vec<String> = a*b*c;\n# not a heading\n```";
+        let mut message = Config::fake_message_with_text(text);
+        message.date = SAMPLE_DATE;
+        message.is_from_me = true;
+        assert_eq!(
+            exporter.format_timeline_message(&message).unwrap(),
+            format!("**5:29:42 PM — Me**\n\n{text}\n\n")
+        );
+
+        // An edited message whose last line closes a fence gets its marker on
+        // the next line, where it cannot stop the fence from closing.
+        message.date_edited = SAMPLE_DATE + 60_000_000_000;
+        message.edited_parts = Some(EditedMessage {
+            parts: vec![EditedMessagePart {
+                status: EditStatus::Edited,
+                edit_history: vec![],
+                unsend_failed: false,
+            }],
+            unsupported_handles: vec![],
+        });
+        assert_eq!(
+            exporter.format_timeline_message(&message).unwrap(),
+            format!("**5:29:42 PM — Me**\n\n{text}\n{EDITED_MARKER}\n\n")
+        );
+
+        // A subject follows its label, so its fences are all escaped.
+        let mut message = Config::fake_message_with_text("body");
+        message.date = SAMPLE_DATE;
+        message.is_from_me = true;
+        message.subject = Some("```\ncode\n```".to_string());
+        assert_eq!(
+            exporter.format_timeline_message(&message).unwrap(),
+            "**5:29:42 PM — Me**\n\n*Subject:* \\```\ncode\n\\```\n\nbody\n\n"
+        );
     }
 
     #[test]
