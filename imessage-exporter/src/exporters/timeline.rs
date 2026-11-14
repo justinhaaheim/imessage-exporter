@@ -84,6 +84,40 @@ struct ThreadEntry {
     messages: Vec<String>,
 }
 
+// MARK: ThreadLabels
+/// Thread headings already computed, keyed by chat rowid.
+///
+/// The heading comes from upstream's `Config::filename`, which prints
+/// "Found error: message chat ID N has no members!" each time it runs for a
+/// chat with no participants. The TXT and HTML exporters call it once per
+/// chat, so the timeline caches the heading and calls it once per chat too
+/// (djf.5). Keyed by the chat row passed to `Config::filename`, so every
+/// heading is exactly what an uncached call would return.
+#[derive(Default)]
+struct ThreadLabels {
+    by_chat: HashMap<i32, String>,
+    /// How many headings were computed instead of read from the cache.
+    #[cfg(test)]
+    computed: usize,
+}
+
+impl ThreadLabels {
+    /// The cached heading for `chat_rowid`, computing it with `compute` the
+    /// first time the chat is seen.
+    fn get_or_compute(&mut self, chat_rowid: i32, compute: impl FnOnce() -> String) -> String {
+        self.by_chat
+            .entry(chat_rowid)
+            .or_insert_with(|| {
+                #[cfg(test)]
+                {
+                    self.computed += 1;
+                }
+                compute()
+            })
+            .clone()
+    }
+}
+
 // MARK: Timeline
 pub struct Timeline<'a> {
     /// Data that is set up from the application's runtime
@@ -98,6 +132,8 @@ pub struct Timeline<'a> {
     /// (sort by local-day at the SQL layer, flush per-day) would scale
     /// better.
     grouped: BTreeMap<NaiveDate, HashMap<ThreadKey, ThreadEntry>>,
+    /// Thread headings computed so far, one per chat.
+    thread_labels: ThreadLabels,
     /// Progress bar model
     pb: ExportProgress,
 }
@@ -119,6 +155,7 @@ impl<'a> Timeline<'a> {
             config,
             file: BufWriter::new(file),
             grouped: BTreeMap::new(),
+            thread_labels: ThreadLabels::default(),
             pb: ExportProgress::new(config.options.show_progress && stderr().is_terminal()),
         })
     }
@@ -210,12 +247,14 @@ impl<'a> Timeline<'a> {
 
     /// Resolve the thread key and the human-readable label for a message's
     /// thread. Falls back to a single `Orphaned` bucket for messages with no
-    /// associated chat.
-    fn thread_key_and_name(&self, msg: &Message) -> (ThreadKey, String) {
-        match self.config.conversation(msg) {
+    /// associated chat. The label is computed once per chat (djf.5).
+    fn thread_key_and_name(&mut self, msg: &Message) -> (ThreadKey, String) {
+        let config = self.config;
+        match config.conversation(msg) {
             Some((chatroom, real_id)) => (
                 ThreadKey::Chat(*real_id),
-                chat_display_label(self.config, chatroom),
+                self.thread_labels
+                    .get_or_compute(chatroom.rowid, || chat_display_label(config, chatroom)),
             ),
             None => (ThreadKey::Orphaned, ORPHANED_THREAD_LABEL.to_string()),
         }
@@ -946,6 +985,61 @@ mod tests {
         let entry = bucket.values().next().unwrap();
         assert_eq!(entry.messages.len(), 2);
         assert_eq!(entry.first_timestamp, 674526582885055488);
+    }
+
+    #[test]
+    fn thread_label_is_computed_once_per_chat() {
+        // djf.5: chats with no name and no participants make upstream's
+        // `Config::filename` print a "has no members" warning per call.
+        let mut config =
+            Config::fake_app(isolated_options("thread_label_is_computed_once_per_chat"));
+        for (rowid, identifier) in [(1, "chat-one"), (2, "chat-two")] {
+            let mut chat = fake_chat();
+            chat.rowid = rowid;
+            chat.chat_identifier = identifier.to_string();
+            config.chatrooms.insert(rowid, chat);
+            config.real_chatrooms.insert(rowid, rowid);
+        }
+        let mut exporter = Timeline::new(&config).unwrap();
+
+        // Five messages in chat 1 over two days, three in chat 2.
+        let one_day = 86_400_000_000_000;
+        let messages = [
+            (1, 0),
+            (1, 1),
+            (2, 2),
+            (1, one_day),
+            (2, one_day + 1),
+            (1, one_day + 2),
+            (2, one_day + 3),
+            (1, one_day + 4),
+        ];
+        for (chat_id, offset) in messages {
+            let mut msg = Config::fake_message();
+            msg.date = SAMPLE_DATE + offset;
+            msg.chat_id = Some(chat_id);
+            exporter
+                .collect_message(&msg, "block\n".to_string())
+                .unwrap();
+        }
+
+        assert_eq!(exporter.thread_labels.computed, 2);
+        assert_eq!(exporter.thread_labels.by_chat.len(), 2);
+        // Cached headings are what an uncached call returns.
+        for (rowid, expected) in [(1, "chat-one"), (2, "chat-two")] {
+            assert_eq!(exporter.thread_labels.by_chat[&rowid], expected);
+            assert_eq!(
+                chat_display_label(&config, &config.chatrooms[&rowid]),
+                expected
+            );
+        }
+        // Both days carry both threads, each under its heading.
+        assert_eq!(exporter.grouped.len(), 2);
+        for bucket in exporter.grouped.values() {
+            let mut names: Vec<&str> = bucket.values().map(|e| e.display_name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["chat-one", "chat-two"]);
+        }
     }
 
     #[test]
