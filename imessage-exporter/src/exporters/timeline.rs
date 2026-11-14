@@ -402,11 +402,17 @@ impl<'a> Timeline<'a> {
 
                     if has_attachments {
                         if let Some(att) = attachments.get(attachment_index) {
+                            // djf.8: name a sticker as a sticker, as TXT does.
+                            let (kind, fallback) = if att.is_sticker {
+                                ("Sticker", "sticker")
+                            } else {
+                                ("Attachment", "attachment")
+                            };
                             let label = att
                                 .filename()
                                 .or(att.transfer_name.as_deref())
-                                .unwrap_or("attachment");
-                            let _ = writeln!(out, "*[Attachment: {label}]*");
+                                .unwrap_or(fallback);
+                            let _ = writeln!(out, "*[{kind}: {label}]*");
                             out.push('\n');
                             wrote_body = true;
                             attachment_index += 1;
@@ -784,7 +790,7 @@ mod tests {
         rusqlite::{Connection, params},
         tables::{
             chat::Chat,
-            messages::models::{AttributedRange, BubbleComponent},
+            messages::models::{AttachmentMeta, AttributedRange, BubbleComponent},
             table::{FITNESS_RECEIVER, ME},
         },
     };
@@ -1228,6 +1234,9 @@ mod tests {
     const MUSIC_ROW: i32 = 9002;
     const POLL_ROW: i32 = 9003;
     const OPENTABLE_ROW: i32 = 9006;
+    /// Message rowids joined to a sticker and to an ordinary attachment.
+    const STICKER_ROW: i32 = 9007;
+    const PHOTO_ROW: i32 = 9008;
     /// A rowid with no row in the scratch database, so it has no payload.
     const MISSING_ROW: i32 = 9999;
     const POLL_GUID: &str = "timeline-test-poll";
@@ -1302,6 +1311,40 @@ mod tests {
                         row.associated_type,
                         payload
                     ],
+                )
+                .unwrap();
+            }
+
+            // djf.8: a sticker and an ordinary attachment, each joined to a
+            // message rowid that the attachment tests build by hand.
+            for (attachment_rowid, message_rowid, name, is_sticker) in [
+                (9101, STICKER_ROW, "outline.heic", true),
+                (9102, PHOTO_ROW, "photo.jpg", false),
+            ] {
+                db.execute(
+                    "INSERT INTO message (ROWID, guid, date, is_from_me) VALUES (?1, ?2, ?3, 1)",
+                    params![
+                        message_rowid,
+                        format!("timeline-test-attachment-message-{message_rowid}"),
+                        SAMPLE_DATE
+                    ],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO attachment (ROWID, guid, original_guid, transfer_name, is_sticker) \
+                     VALUES (?1, ?2, ?2, ?3, ?4)",
+                    params![
+                        attachment_rowid,
+                        format!("timeline-test-attachment-{attachment_rowid}"),
+                        name,
+                        is_sticker
+                    ],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO message_attachment_join (message_id, attachment_id) \
+                     VALUES (?1, ?2)",
+                    params![message_rowid, attachment_rowid],
                 )
                 .unwrap();
             }
@@ -1534,6 +1577,43 @@ mod tests {
         assert_eq!(
             exporter.format_timeline_message(&char_and_text).unwrap(),
             "**5:29:42 PM — Me**\n\n*\u{FFFC}hello*\n\n"
+        );
+    }
+
+    // MARK: Attachments (djf.8)
+    /// A message from me at 5:29:42 PM PT whose body is one attachment.
+    fn attachment_message(rowid: i32) -> Message {
+        let mut message = Config::fake_message();
+        message.rowid = rowid;
+        message.date = SAMPLE_DATE;
+        message.is_from_me = true;
+        message.text = Some(OBJECT_REPLACEMENT_CHAR.to_string());
+        message.num_attachments = 1;
+        message.components = vec![BubbleComponent::Run(vec![AttributedRange::attachment(
+            0,
+            OBJECT_REPLACEMENT_CHAR.len_utf8(),
+            AttachmentMeta::default(),
+        )])];
+        message
+    }
+
+    #[test]
+    fn sticker_is_named_a_sticker() {
+        let config = seeded_config("sticker_is_named_a_sticker");
+        let exporter = Timeline::new(&config).unwrap();
+
+        assert_eq!(
+            exporter
+                .format_timeline_message(&attachment_message(STICKER_ROW))
+                .unwrap(),
+            "**5:29:42 PM — Me**\n\n*[Sticker: outline.heic]*\n\n"
+        );
+        // An ordinary attachment keeps its old label.
+        assert_eq!(
+            exporter
+                .format_timeline_message(&attachment_message(PHOTO_ROW))
+                .unwrap(),
+            "**5:29:42 PM — Me**\n\n*[Attachment: photo.jpg]*\n\n"
         );
     }
 
