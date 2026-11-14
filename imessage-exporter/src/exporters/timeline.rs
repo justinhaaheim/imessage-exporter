@@ -36,6 +36,7 @@ use crate::{
 use imessage_database::{
     error::table::TableError,
     message_types::variants::{Announcement, KeptMessage, Tapback, TapbackAction, Variant},
+    rusqlite,
     tables::{
         attachment::Attachment,
         chat::Chat,
@@ -62,6 +63,25 @@ pub(crate) const APP_MESSAGE_PLACEHOLDER: &str = "[App message]";
 /// U+FFFC, which Messages puts in a message's text where an attachment or an
 /// app balloon sits.
 const OBJECT_REPLACEMENT_CHAR: char = '\u{FFFC}';
+
+/// Shown in place of a time when a message's date cannot be converted.
+const UNKNOWN_TIME: &str = "(unknown time)";
+
+/// Shown under a reply's header in its own day when the message it answers
+/// cannot be found (djf.12 F2).
+const REPLY_TO_UNKNOWN_PARENT: &str = "*(reply to an earlier message)*";
+
+// MARK: Placement
+/// Where a message block is shown (djf.12 F2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Placement {
+    /// Under the message's own day. A reply shown here gets a line naming
+    /// when the message it answers was sent.
+    OwnDay,
+    /// Inside the block of the message it replies to, which sits under the
+    /// day `shown_on` (`None` when that message's date cannot be converted).
+    Nested { shown_on: Option<NaiveDate> },
+}
 
 // MARK: ThreadKey
 /// Key used to group messages by thread within a single day.
@@ -343,17 +363,75 @@ impl<'a> Timeline<'a> {
     fn format_time_of_day(&self, msg: &Message) -> String {
         match msg.date() {
             Ok(d) => format_time(&d.with_timezone(&self.config.options.timezone)),
-            Err(_) => "(unknown time)".to_string(),
+            Err(_) => UNKNOWN_TIME.to_string(),
         }
     }
 
-    /// Build the full Markdown block for a single (non-announcement) message,
-    /// including a header line, body, simple attachment placeholders, and
-    /// any nested replies as Markdown blockquotes.
+    /// The local date and time of `msg`, or `None` when its date cannot be
+    /// converted.
+    fn local_date_time(&self, msg: &Message) -> Option<DateTime<Zone>> {
+        msg.date()
+            .ok()
+            .map(|d| d.with_timezone(&self.config.options.timezone))
+    }
+
+    /// The time shown in the header of a reply nested under the message it
+    /// answers (djf.12 F2). The block sits under the day `shown_on`, so a
+    /// reply sent that day shows only its time, as before, and a reply sent
+    /// on another day shows its full date and time.
+    fn format_nested_time(&self, msg: &Message, shown_on: Option<NaiveDate>) -> String {
+        match self.local_date_time(msg) {
+            Some(local) if shown_on == Some(local.date_naive()) => format_time(&local),
+            Some(local) => format_date_time(&local),
+            None => UNKNOWN_TIME.to_string(),
+        }
+    }
+
+    /// The italic line under a reply's header in its own day (djf.12 F2),
+    /// naming when the message it answers was sent, since that message and
+    /// this reply's other copy may sit under another day.
+    ///
+    /// A parent that is not in the database, or whose date cannot be
+    /// converted, gives `*(reply to an earlier message)*`. Any other database
+    /// error is returned, so the message is reported and skipped like any
+    /// other message that cannot be read (djf.7).
+    fn format_reply_context(&self, parent_guid: &str) -> Result<String, TableError> {
+        let parent = match Message::from_guid(
+            parent_guid,
+            self.config.data_source.db(),
+            &self.config.data_source.capabilities,
+        ) {
+            Ok(parent) => Some(parent),
+            Err(TableError::QueryError(rusqlite::Error::QueryReturnedNoRows)) => None,
+            Err(why) => return Err(why),
+        };
+        Ok(
+            match parent.as_ref().and_then(|p| self.local_date_time(p)) {
+                Some(sent) => format!("*(reply to a message from {})*", format_date_time(&sent)),
+                None => REPLY_TO_UNKNOWN_PARENT.to_string(),
+            },
+        )
+    }
+
+    /// Build the full Markdown block for a single (non-announcement) message
+    /// shown under its own day: a header line, body, simple attachment
+    /// placeholders, and any nested replies as Markdown blockquotes.
     fn format_timeline_message(&self, msg: &Message) -> Result<String, TableError> {
+        self.format_message_block(msg, Placement::OwnDay)
+    }
+
+    /// [`Self::format_timeline_message`] for a message shown at `placement`.
+    fn format_message_block(
+        &self,
+        msg: &Message,
+        placement: Placement,
+    ) -> Result<String, TableError> {
         let mut out = String::with_capacity(256);
 
-        let time = self.format_time_of_day(msg);
+        let time = match placement {
+            Placement::OwnDay => self.format_time_of_day(msg),
+            Placement::Nested { shown_on } => self.format_nested_time(msg, shown_on),
+        };
         let sender = self
             .config
             .who(msg.handle_id, msg.is_from_me(), &msg.destination_caller_id);
@@ -361,6 +439,16 @@ impl<'a> Timeline<'a> {
         // Header line: bold time + em-dash + bold sender.
         let _ = writeln!(out, "**{time} — {sender}**");
         out.push('\n');
+
+        // djf.12 F2: a reply is shown twice, nested under the message it
+        // answers and under its own day. The nested copy is visibly a reply;
+        // this copy says what it answers.
+        if placement == Placement::OwnDay
+            && let Some(parent_guid) = &msg.thread_originator_guid
+        {
+            let _ = writeln!(out, "{}", self.format_reply_context(parent_guid)?);
+            out.push('\n');
+        }
 
         if msg.is_deleted() {
             out.push_str("*(this message was deleted from the conversation)*\n\n");
@@ -504,6 +592,11 @@ impl<'a> Timeline<'a> {
         }
 
         // Replies: render each as a blockquote so the threading is visible.
+        // Every nested copy sits under the day of the outermost message.
+        let shown_on = match placement {
+            Placement::OwnDay => self.local_date_time(msg).map(|d| d.date_naive()),
+            Placement::Nested { shown_on } => shown_on,
+        };
         let replies = msg.get_replies(
             self.config.data_source.db(),
             &self.config.data_source.capabilities,
@@ -516,7 +609,8 @@ impl<'a> Timeline<'a> {
                     if reply.is_tapback() || reply.is_poll_vote() || reply.is_poll_update() {
                         continue;
                     }
-                    let nested = self.format_timeline_message(reply)?;
+                    let nested =
+                        self.format_message_block(reply, Placement::Nested { shown_on })?;
                     out.push_str(&blockquote(&nested));
                     out.push('\n');
                 }
@@ -670,6 +764,13 @@ impl<'a> Timeline<'a> {
 /// `imessage_database::util::dates::format` helper would.
 pub(crate) fn format_time(date: &DateTime<Zone>) -> String {
     date.format("%-l:%M:%S %p").to_string()
+}
+
+/// Format a `DateTime` in the export's timezone as "Fri, Feb 7, 2025 1:25:24
+/// PM", for a time shown away from its own day heading (djf.12 F2). chrono's
+/// `%a` and `%b` are always the English abbreviations.
+pub(crate) fn format_date_time(date: &DateTime<Zone>) -> String {
+    date.format("%a, %b %-d, %Y %-l:%M:%S %p").to_string()
 }
 
 /// Build the H1 day header, e.g. "# Saturday, March 21, 2026\n\n".
@@ -1407,6 +1508,12 @@ mod tests {
     /// A parent message whose one reply is at `PARENT_ROW + 1`.
     const PARENT_ROW: i32 = 9020;
     const PARENT_GUID: &str = "timeline-test-parent";
+    /// A parent message whose one reply, at `NEXT_DAY_PARENT_ROW + 1`, was
+    /// sent the next day.
+    const NEXT_DAY_PARENT_ROW: i32 = 9022;
+    const NEXT_DAY_PARENT_GUID: &str = "timeline-test-parent-next-day";
+    const NEXT_DAY_REPLY_GUID: &str = "timeline-test-reply-next-day";
+    const ONE_DAY: i64 = 86_400_000_000_000;
     /// A rowid with no row in the scratch database, so it has no payload.
     const MISSING_ROW: i32 = 9999;
     const POLL_GUID: &str = "timeline-test-poll";
@@ -1530,6 +1637,25 @@ mod tests {
                 "INSERT INTO message (ROWID, guid, date, is_from_me, text, thread_originator_guid) \
                  VALUES (?1, 'timeline-test-reply', ?2, 1, '# reply heading', ?3)",
                 params![PARENT_ROW + 1, SAMPLE_DATE + 1, PARENT_GUID],
+            )
+            .unwrap();
+
+            // djf.12 F2: a parent message and a reply sent the next day.
+            db.execute(
+                "INSERT INTO message (ROWID, guid, date, is_from_me, text) \
+                 VALUES (?1, ?2, ?3, 1, 'parent')",
+                params![NEXT_DAY_PARENT_ROW, NEXT_DAY_PARENT_GUID, SAMPLE_DATE],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO message (ROWID, guid, date, is_from_me, text, thread_originator_guid) \
+                 VALUES (?1, ?2, ?3, 1, 'reply sent the next day', ?4)",
+                params![
+                    NEXT_DAY_PARENT_ROW + 1,
+                    NEXT_DAY_REPLY_GUID,
+                    SAMPLE_DATE + ONE_DAY,
+                    NEXT_DAY_PARENT_GUID
+                ],
             )
             .unwrap();
             path
@@ -2061,6 +2187,77 @@ mod tests {
         assert_eq!(
             actual,
             "**5:29:42 PM — Me**\n\nparent\n\n> **5:29:42 PM — Me**\n>\n> \\# reply heading\n>\n\n"
+        );
+    }
+
+    // MARK: Replies (djf.12 F2)
+    /// A parent message from me at 5:29:42 PM PT on Tuesday, May 17, 2022,
+    /// with one reply.
+    fn parent_message(rowid: i32, guid: &str) -> Message {
+        let mut parent = Config::fake_message_with_text("parent");
+        parent.rowid = rowid;
+        parent.guid = guid.to_string();
+        parent.date = SAMPLE_DATE;
+        parent.is_from_me = true;
+        parent.num_replies = 1;
+        parent
+    }
+
+    #[test]
+    fn reply_sent_on_another_day_shows_its_full_date_when_nested() {
+        let config = seeded_config("reply_sent_on_another_day_shows_its_full_date_when_nested");
+        let exporter = Timeline::new(&config).unwrap();
+        let parent = parent_message(NEXT_DAY_PARENT_ROW, NEXT_DAY_PARENT_GUID);
+
+        assert_eq!(
+            exporter.format_timeline_message(&parent).unwrap(),
+            "**5:29:42 PM — Me**\n\nparent\n\n> **Wed, May 18, 2022 5:29:42 PM — Me**\n>\n> reply sent the next day\n>\n\n"
+        );
+    }
+
+    #[test]
+    fn reply_sent_the_same_day_shows_only_its_time_when_nested() {
+        let config = seeded_config("reply_sent_the_same_day_shows_only_its_time_when_nested");
+        let exporter = Timeline::new(&config).unwrap();
+        let parent = parent_message(PARENT_ROW, PARENT_GUID);
+
+        let actual = exporter.format_timeline_message(&parent).unwrap();
+        assert!(
+            actual.starts_with("**5:29:42 PM — Me**\n\nparent\n\n> **5:29:42 PM — Me**\n>\n"),
+            "got:\n{actual}"
+        );
+        assert!(!actual.contains("reply to"), "got:\n{actual}");
+    }
+
+    #[test]
+    fn reply_under_its_own_day_names_when_its_parent_was_sent() {
+        let config = seeded_config("reply_under_its_own_day_names_when_its_parent_was_sent");
+        let exporter = Timeline::new(&config).unwrap();
+        let reply = Message::from_guid(
+            NEXT_DAY_REPLY_GUID,
+            config.data_source.db(),
+            &config.data_source.capabilities,
+        )
+        .unwrap();
+
+        assert_eq!(
+            exporter.format_timeline_message(&reply).unwrap(),
+            "**5:29:42 PM — Me**\n\n*(reply to a message from Tue, May 17, 2022 5:29:42 PM)*\n\nreply sent the next day\n\n"
+        );
+    }
+
+    #[test]
+    fn reply_whose_parent_is_missing_says_an_earlier_message() {
+        let config = seeded_config("reply_whose_parent_is_missing_says_an_earlier_message");
+        let exporter = Timeline::new(&config).unwrap();
+        let mut reply = Config::fake_message_with_text("orphaned reply");
+        reply.date = SAMPLE_DATE;
+        reply.is_from_me = true;
+        reply.thread_originator_guid = Some("timeline-test-no-such-parent".to_string());
+
+        assert_eq!(
+            exporter.format_timeline_message(&reply).unwrap(),
+            "**5:29:42 PM — Me**\n\n*(reply to an earlier message)*\n\norphaned reply\n\n"
         );
     }
 
