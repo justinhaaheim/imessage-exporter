@@ -13,21 +13,21 @@ const STICKER_EFFECT_PREFIX: [u8; 20] = [
 /// Bytes for `"/>`
 const STICKER_EFFECT_SUFFIX: [u8; 3] = [34, 47, 62];
 
-/// Represents the source that created a sticker attachment
+/// Source that created a sticker attachment.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StickerSource {
     /// A [Genmoji](https://support.apple.com/guide/iphone/create-genmoji-with-apple-intelligence-iph4e76f5667/ios)
     Genmoji,
     /// A [Memoji](https://support.apple.com/en-us/111115)
     Memoji,
-    /// User-created stickers
+    /// User-created sticker.
     UserGenerated,
-    /// Application provided stickers
+    /// Sticker from an iMessage sticker app.
     App(String),
 }
 
 impl StickerSource {
-    /// Given an application's bundle ID, determine the source
+    /// Resolve a sticker source from the sticker app bundle ID.
     ///
     /// # Example
     ///
@@ -52,26 +52,48 @@ impl StickerSource {
     }
 }
 
+/// Format-agnostic description of a sticker's source, ready for rendering by
+/// callers. Produced by [`Attachment::get_sticker_decoration`](crate::tables::attachment::Attachment::get_sticker_decoration).
+///
+/// `None` from `get_sticker_decoration` means one of:
+/// - The sticker has no readable source (missing `STICKER_USER_INFO`,
+///   malformed plist, or unrecognized bundle id).
+/// - The source is [`StickerSource::Genmoji`] but no description is stored.
+/// - The source is [`StickerSource::UserGenerated`] but the effect blob is
+///   missing or unreadable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StickerDecoration {
+    /// A [`StickerSource::Genmoji`] with the user-supplied prompt.
+    GenmojiPrompt(String),
+    /// A [`StickerSource::Memoji`]; no further data.
+    Memoji,
+    /// A [`StickerSource::UserGenerated`] sticker with the parsed [`StickerEffect`].
+    Effect(StickerEffect),
+    /// A [`StickerSource::App`] sticker; the string is the resolved app name
+    /// or, if that lookup fails, the bundle id.
+    AppName(String),
+}
+
 /// Represents different types of [sticker effects](https://www.macrumors.com/how-to/add-effects-to-stickers-in-messages/) that can be applied to sticker iMessage balloons.
 #[derive(Debug, PartialEq, Eq, Default)]
 pub enum StickerEffect {
-    /// Sticker sent with no effect
+    /// Sticker sent with no effect.
     #[default]
     Normal,
-    /// Internally referred to as `stroke`
+    /// `stroke` effect in sticker EXIF metadata.
     Outline,
-    /// Comic effect applied to the sticker
+    /// Comic effect.
     Comic,
-    /// Puffy effect applied to the sticker
+    /// Puffy effect.
     Puffy,
-    /// Internally referred to as `iridescent`
+    /// `iridescent` effect in sticker EXIF metadata.
     Shiny,
-    /// Other unrecognized sticker effect
+    /// Unrecognized sticker effect name.
     Other(String),
 }
 
 impl StickerEffect {
-    /// Determine the type of a sticker from parsed `HEIC` `EXIF` data
+    /// Map the raw EXIF sticker effect name to a [`StickerEffect`].
     fn from_exif(sticker_effect_type: &str) -> Self {
         match sticker_effect_type {
             "stroke" => Self::Outline,
@@ -96,7 +118,7 @@ impl Display for StickerEffect {
     }
 }
 
-/// Parse the sticker effect type from the EXIF data of a HEIC blob
+/// Parse the sticker effect type from HEIC EXIF data.
 #[must_use]
 pub fn get_sticker_effect(mut heic_data: &[u8]) -> StickerEffect {
     // Find the start index and drain

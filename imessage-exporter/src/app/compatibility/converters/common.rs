@@ -1,7 +1,8 @@
 /*!
- Defines routines common across all converters.
+ Shared file and process helpers for attachment converters.
 */
 use std::{
+    ffi::OsStr,
     fs::{File, FileTimes, copy, create_dir_all, metadata, read_dir},
     path::Path,
     process::{Command, Stdio},
@@ -12,8 +13,13 @@ use imessage_database::tables::messages::Message;
 
 use crate::app::runtime::Config;
 
-/// Run a command, ignoring output; returning [`None`] if the process cannot be spawned or waited on.
-pub(super) fn run_command(command: &str, args: Vec<&str>) -> Option<()> {
+/// Run a command, ignoring output. Returns [`None`] if the process cannot be
+/// spawned, cannot be waited on, or exits with a non-zero status.
+pub(super) fn run_command<I, S>(command: &str, args: I) -> Option<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     match Command::new(command)
         .args(args)
         .stdout(Stdio::null())
@@ -22,7 +28,11 @@ pub(super) fn run_command(command: &str, args: Vec<&str>) -> Option<()> {
         .spawn()
     {
         Ok(mut convert) => match convert.wait() {
-            Ok(_) => Some(()),
+            Ok(status) if status.success() => Some(()),
+            Ok(status) => {
+                eprintln!("Conversion failed: {command} exited with {status}");
+                None
+            }
             Err(why) => {
                 eprintln!("Conversion failed: {why}");
                 None
@@ -35,15 +45,8 @@ pub(super) fn run_command(command: &str, args: Vec<&str>) -> Option<()> {
     }
 }
 
-/// Get the path details formatted for a CLI argument and ensure the directory tree exists
-pub(super) fn ensure_paths<'a>(from: &'a Path, to: &'a Path) -> Option<(&'a str, &'a str)> {
-    // Get the path we want to copy from
-    let from_path = from.to_str()?;
-
-    // Get the path we want to write to
-    let to_path = to.to_str()?;
-
-    // Ensure the directory tree exists
+/// Ensure the parent directory of `to` exists, creating it if necessary.
+pub(super) fn ensure_output_dir(to: &Path) -> Option<()> {
     if let Some(folder) = to.parent()
         && !folder.exists()
         && let Err(why) = create_dir_all(folder)
@@ -51,13 +54,12 @@ pub(super) fn ensure_paths<'a>(from: &'a Path, to: &'a Path) -> Option<(&'a str,
         eprintln!("Unable to create {}: {why}", folder.display());
         return None;
     }
-    Some((from_path, to_path))
+    Some(())
 }
 
-/// Copy a file or directory without altering it
+/// Copy a file or directory without altering it.
 pub(crate) fn copy_raw(from: &Path, to: &Path) {
     if from.is_dir() {
-        // Ensure the directory tree exists
         if let Err(why) = create_dir_all(to) {
             eprintln!("Unable to create directory {}: {why}", to.display());
             return;
@@ -103,7 +105,7 @@ pub(crate) fn copy_raw(from: &Path, to: &Path) {
     }
 }
 
-/// Update the metadata of a copied file, falling back to the original file's metadata if necessary
+/// Update copied-file timestamps from the message date and source metadata.
 pub(crate) fn update_file_metadata(from: &Path, to: &Path, message: &Message, config: &Config) {
     if to.is_dir() {
         return;
@@ -111,7 +113,7 @@ pub(crate) fn update_file_metadata(from: &Path, to: &Path, message: &Message, co
 
     // Update file metadata
     if let Ok(metadata) = metadata(from) {
-        // The modification time is the message's date, otherwise the original file's modification time
+        // Prefer the message date for mtime, then fall back to the source file.
         let mtime = match message.date(config.offset) {
             Ok(date) => unix_to_system_time(date.timestamp(), date.timestamp_subsec_nanos())
                 .or_else(|| metadata.modified().ok()),

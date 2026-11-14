@@ -1,5 +1,5 @@
-pub mod exporter;
+pub mod formatter;
 pub mod html;
-mod shared;
+pub(crate) mod shared;
 pub mod timeline;
 pub mod txt;

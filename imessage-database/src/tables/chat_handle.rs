@@ -1,5 +1,5 @@
 /*!
- This module represents the chat to handle join table.
+ Chat-to-handle join table helpers.
 */
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -15,7 +15,7 @@ use crate::{
 use rusqlite::{CachedStatement, Connection, Result, Row};
 
 // MARK: Struct
-/// Represents a single row in the `chat_handle_join` table.
+/// Row from the `chat_handle_join` table.
 #[derive(Debug)]
 pub struct ChatToHandle {
     chat_id: i32,
@@ -39,11 +39,11 @@ impl Table for ChatToHandle {
 impl Cacheable for ChatToHandle {
     type K = i32;
     type V = BTreeSet<i32>;
-    /// Generate a hashmap containing each chatroom's ID pointing to a `BTreeSet` of participant handle IDs
+    /// Cache participant handle IDs by chat row ID.
     ///
     /// # Example:
     ///
-    /// ```
+    /// ```no_run
     /// use imessage_database::util::dirs::default_db_path;
     /// use imessage_database::tables::table::{Cacheable, get_connection};
     /// use imessage_database::tables::chat_handle::ChatToHandle;
@@ -56,10 +56,8 @@ impl Cacheable for ChatToHandle {
         let mut cache: HashMap<i32, BTreeSet<i32>> = HashMap::new();
 
         let mut rows = ChatToHandle::get(db)?;
-        let mappings = rows.query_map([], |row| Ok(ChatToHandle::from_row(row)))?;
-
-        for mapping in mappings {
-            let joiner = ChatToHandle::extract(mapping)?;
+        for mapping in ChatToHandle::rows(&mut rows, [])? {
+            let joiner = mapping?;
             if let Some(handles) = cache.get_mut(&joiner.chat_id) {
                 handles.insert(joiner.handle_id);
             } else {
@@ -75,14 +73,13 @@ impl Cacheable for ChatToHandle {
 
 // MARK: Diagnostic
 impl ChatToHandle {
-    /// Compute diagnostic data for the Chat to Handle join table
+    /// Compute diagnostic data for the `chat_handle_join` table.
     ///
-    /// Get the number of chats referenced in the messages table
-    /// that do not exist in this join table:
+    /// Counts chats referenced by messages but missing from this join table.
     ///
     /// # Example:
     ///
-    /// ```
+    /// ```no_run
     /// use imessage_database::util::dirs::default_db_path;
     /// use imessage_database::tables::table::get_connection;
     /// use imessage_database::tables::chat_handle::ChatToHandle;
@@ -92,7 +89,7 @@ impl ChatToHandle {
     /// ChatToHandle::run_diagnostic(&conn);
     /// ```
     pub fn run_diagnostic(db: &Connection) -> Result<ChatHandleDiagnostic, TableError> {
-        // Get the Chat IDs that are associated with messages
+        // Chats referenced by messages.
         let mut statement_message_chats =
             db.prepare(&format!("SELECT DISTINCT chat_id from {CHAT_MESSAGE_JOIN}"))?;
         let statement_message_chat_rows =
@@ -104,7 +101,7 @@ impl ChatToHandle {
             }
         });
 
-        // Get the Chat IDs that are associated with handles
+        // Chats with associated handles.
         let mut statement_handle_chats =
             db.prepare(&format!("SELECT DISTINCT chat_id from {CHAT_HANDLE_JOIN}"))?;
         let statement_handle_chat_rows =
@@ -143,14 +140,14 @@ impl ChatToHandle {
 }
 
 impl ChatToHandle {
-    /// Get the chat lookup map from the database, if it exists
+    /// Load the `chat_lookup` canonical chat map when the table exists.
     ///
-    /// This is used to map chat IDs that are split across services to a canonical chat ID
-    /// for deduplication purposes.
+    /// The map links chat IDs split across services to a canonical chat ID for
+    /// deduplication.
     ///
     /// # Example:
     ///
-    /// ```
+    /// ```no_run
     /// use imessage_database::util::dirs::default_db_path;
     /// use imessage_database::tables::table::get_connection;
     /// use imessage_database::tables::chat_handle::ChatToHandle;
@@ -160,7 +157,7 @@ impl ChatToHandle {
     /// ChatToHandle::get_chat_lookup_map(&conn);
     /// ```
     pub fn get_chat_lookup_map(conn: &Connection) -> Result<HashMap<i32, i32>, TableError> {
-        // Query `chat_lookup`, if it exists, to merge chat IDs split across services
+        // `chat_lookup` links chats split across services.
         let mut stmt = conn.prepare(
             "
 WITH RECURSIVE
@@ -208,16 +205,16 @@ ORDER BY chat;
         Ok(chat_lookup_map)
     }
 
-    /// Given the initial set of duplicated chats, deduplicate them based on the participants
+    /// Assign stable deduplicated IDs to chats.
     ///
-    /// This returns a new hashmap that maps the real chat ID to a new deduplicated unique chat ID
-    /// that represents a single chat for all of the same participants, even if they have multiple handles.
+    /// Chats merge when they have the same participant set or are linked by
+    /// `chat_lookup`.
     ///
     /// Assuming no new chat-handle relationships have been written to the database, deduplicated data is deterministic across runs.
     ///
     /// # Example:
     ///
-    /// ```
+    /// ```no_run
     /// use std::collections::HashMap;
     ///
     /// use imessage_database::util::dirs::default_db_path;
@@ -235,7 +232,6 @@ ORDER BY chat;
     ) -> Result<HashMap<i32, i32>, TableError> {
         let mut uf = UnionFind::new();
 
-        // Initialize a set for every chat ID
         for chat_id in duplicated_data.keys() {
             uf.make_set(*chat_id);
         }
@@ -266,8 +262,8 @@ ORDER BY chat;
             }
         }
 
-        // Assign unique sequential IDs to each equivalence class,
-        // iterating in sorted chat ID order for determinism
+        // Assign unique sequential IDs to each equivalence class in sorted
+        // chat ID order.
         let mut deduplicated_chats: HashMap<i32, i32> = HashMap::new();
         let mut representative_to_id: HashMap<i32, i32> = HashMap::new();
         let mut next_id = 0;
@@ -430,7 +426,7 @@ mod tests {
         let output = ChatToHandle::dedupe(&input, &chat_lookup_map).unwrap();
 
         // Chats 0,1,5 share participants {1}, and chat 2 maps to 5 via lookup,
-        // and chat 4 maps to 0 via lookup — all are the same conversation
+        // and chat 4 maps to 0 via lookup. All are the same conversation
         assert_eq!(output.get(&0), output.get(&1));
         assert_eq!(output.get(&0), output.get(&4));
         assert_eq!(output.get(&0), output.get(&5));
@@ -521,7 +517,7 @@ mod tests {
         lookup_a.insert(5, 0);
         let output_a = ChatToHandle::dedupe(&input, &lookup_a).unwrap();
 
-        // Case B: canonical is the higher ID (5) — matches real SQL MAX(root) behavior
+        // Case B: canonical is the higher ID (5), which matches real SQL MAX(root) behavior
         let mut lookup_b: HashMap<i32, i32> = HashMap::new();
         lookup_b.insert(0, 5);
         lookup_b.insert(5, 5);

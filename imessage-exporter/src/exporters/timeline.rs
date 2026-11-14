@@ -10,14 +10,13 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::Write as FmtWrite,
     fs::File,
-    io::{BufWriter, Write},
+    io::{BufWriter, IsTerminal, Write, stderr},
 };
 
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 
 use crate::{
     app::{error::RuntimeError, export_type::ExportType, progress::ExportProgress, runtime::Config},
-    exporters::exporter::Exporter,
 };
 
 use imessage_database::{
@@ -28,7 +27,7 @@ use imessage_database::{
         chat::Chat,
         messages::{
             Message,
-            models::{BubbleComponent, GroupAction, TextAttributes},
+            models::{AttributedRange, BubbleComponent, GroupAction},
         },
         table::{ME, ORPHANED, Table, UNKNOWN, YOU},
     },
@@ -85,8 +84,8 @@ pub struct Timeline<'a> {
 }
 
 // MARK: Exporter
-impl<'a> Exporter<'a> for Timeline<'a> {
-    fn new(config: &'a Config) -> Result<Self, RuntimeError> {
+impl<'a> Timeline<'a> {
+    pub fn new(config: &'a Config) -> Result<Self, RuntimeError> {
         let mut path = config.options.export_path.clone();
         path.push(TIMELINE_FILENAME);
 
@@ -101,11 +100,11 @@ impl<'a> Exporter<'a> for Timeline<'a> {
             config,
             file: BufWriter::new(file),
             grouped: BTreeMap::new(),
-            pb: ExportProgress::new(),
+            pb: ExportProgress::new(config.options.show_progress && stderr().is_terminal()),
         })
     }
 
-    fn iter_messages(&mut self) -> Result<(), RuntimeError> {
+    pub fn iter_messages(&mut self) -> Result<(), RuntimeError> {
         eprintln!(
             "Exporting unified timeline to {} as markdown...",
             self.config.options.export_path.display()
@@ -127,12 +126,8 @@ impl<'a> Exporter<'a> for Timeline<'a> {
             &self.config.options.query_context,
         )?;
 
-        let messages = statement
-            .query_map([], |row| Ok(Message::from_row(row)))
-            .map_err(|err| RuntimeError::DatabaseError(TableError::QueryError(err)))?;
-
-        for message in messages {
-            let mut msg = Message::extract(message)?;
+        for message in Message::rows(&mut statement, [])? {
+            let mut msg = message?;
 
             if msg.rowid == current_message_row {
                 current_message += 1;
@@ -164,14 +159,6 @@ impl<'a> Exporter<'a> for Timeline<'a> {
         Ok(())
     }
 
-    /// The Timeline exporter writes everything to a single file, so this
-    /// always returns the same handle. It exists to satisfy the trait.
-    fn get_or_create_file(
-        &mut self,
-        _message: &Message,
-    ) -> Result<&mut BufWriter<File>, RuntimeError> {
-        Ok(&mut self.file)
-    }
 }
 
 // MARK: Grouping
@@ -317,9 +304,14 @@ impl<'a> Timeline<'a> {
         // for the v1 timeline view.
         for component in &msg.components {
             match component {
-                BubbleComponent::Text(text_attrs) => {
+                BubbleComponent::Run(ranges) => {
+                    // Render text ranges and inline attachment ranges in order.
+                    let text_ranges: Vec<AttributedRange> =
+                        ranges.iter().filter(|r| r.attachment.is_none()).cloned().collect();
+                    let has_attachments = ranges.iter().any(|r| r.attachment.is_some());
+
                     if let Some(text) = &msg.text {
-                        let slice = slice_text_for_bubble(text, text_attrs);
+                        let slice = slice_text_for_bubble(text, &text_ranges);
                         let trimmed = slice.trim();
                         if !trimmed.is_empty() {
                             let _ = writeln!(out, "{trimmed}");
@@ -327,20 +319,21 @@ impl<'a> Timeline<'a> {
                             wrote_body = true;
                         }
                     }
-                }
-                BubbleComponent::Attachment(_) => {
-                    if let Some(att) = attachments.get(attachment_index) {
-                        let label = att
-                            .filename()
-                            .or(att.transfer_name.as_deref())
-                            .unwrap_or("attachment");
-                        let _ = writeln!(out, "*[Attachment: {label}]*");
-                        out.push('\n');
-                        wrote_body = true;
-                        attachment_index += 1;
-                    } else {
-                        out.push_str("*[Attachment: missing]*\n\n");
-                        wrote_body = true;
+
+                    if has_attachments {
+                        if let Some(att) = attachments.get(attachment_index) {
+                            let label = att
+                                .filename()
+                                .or(att.transfer_name.as_deref())
+                                .unwrap_or("attachment");
+                            let _ = writeln!(out, "*[Attachment: {label}]*");
+                            out.push('\n');
+                            wrote_body = true;
+                            attachment_index += 1;
+                        } else {
+                            out.push_str("*[Attachment: missing]*\n\n");
+                            wrote_body = true;
+                        }
                     }
                 }
                 BubbleComponent::App => {
@@ -547,7 +540,7 @@ pub(crate) fn format_thread_header(name: &str) -> String {
 /// attributes. Without this, multi-bubble messages render the full message
 /// body once per Text bubble. Mirrors `TXT::format_attributes` (de-dupes
 /// adjacent runs with the same range and ignores out-of-range attributes).
-fn slice_text_for_bubble(text: &str, attributes: &[TextAttributes]) -> String {
+fn slice_text_for_bubble(text: &str, attributes: &[AttributedRange]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_start = 0;
     let mut prev_end = 0;
@@ -618,15 +611,15 @@ pub(crate) fn chat_display_label(config: &Config, chatroom: &Chat) -> String {
 mod tests {
     use super::*;
     use crate::{
-        Config, Exporter, Options,
+        Config, Options,
         app::{contacts::Name, export_type::ExportType},
     };
     use chrono::NaiveDate;
     use imessage_database::{
-        message_types::text_effects::TextEffect,
+        message_types::text_effects::text_effect::TextEffect,
         tables::{
             chat::Chat,
-            messages::models::{BubbleComponent, TextAttributes},
+            messages::models::{AttributedRange, BubbleComponent},
             table::ME,
         },
     };
@@ -747,7 +740,7 @@ mod tests {
 
     #[test]
     fn slice_text_for_bubble_returns_only_the_attribute_range() {
-        let attrs = vec![TextAttributes::new(6, 11, vec![TextEffect::Default])];
+        let attrs = vec![AttributedRange::text(6, 11, vec![TextEffect::Default])];
         assert_eq!(slice_text_for_bubble("Hello world", &attrs), "world");
     }
 
@@ -756,8 +749,8 @@ mod tests {
         // The typedstream parser sometimes emits multiple adjacent attribute
         // entries with the same byte range. We should render the slice once.
         let attrs = vec![
-            TextAttributes::new(0, 5, vec![TextEffect::Default]),
-            TextAttributes::new(0, 5, vec![TextEffect::Default]),
+            AttributedRange::text(0, 5, vec![TextEffect::Default]),
+            AttributedRange::text(0, 5, vec![TextEffect::Default]),
         ];
         assert_eq!(slice_text_for_bubble("Hello world", &attrs), "Hello");
     }
@@ -777,12 +770,12 @@ mod tests {
         message.is_from_me = true;
         // Two text bubbles: "Hi Alice" + ", how are you?"
         message.components = vec![
-            BubbleComponent::Text(vec![TextAttributes::new(
+            BubbleComponent::Run(vec![AttributedRange::text(
                 0,
                 8,
                 vec![TextEffect::Default],
             )]),
-            BubbleComponent::Text(vec![TextAttributes::new(
+            BubbleComponent::Run(vec![AttributedRange::text(
                 8,
                 22,
                 vec![TextEffect::Default],
