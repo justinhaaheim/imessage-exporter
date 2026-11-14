@@ -139,6 +139,9 @@ pub struct Timeline<'a> {
     grouped: BTreeMap<NaiveDate, HashMap<ThreadKey, ThreadEntry>>,
     /// Thread headings computed so far, one per chat.
     thread_labels: ThreadLabels,
+    /// Messages left out because they could not be read (djf.7). Each one is
+    /// reported on stderr when it happens, and the total at the end.
+    skipped_messages: u64,
     /// Progress bar model
     pb: ExportProgress,
 }
@@ -161,6 +164,7 @@ impl<'a> Timeline<'a> {
             file: BufWriter::new(file),
             grouped: BTreeMap::new(),
             thread_labels: ThreadLabels::default(),
+            skipped_messages: 0,
             pb: ExportProgress::new(config.options.show_progress && stderr().is_terminal()),
         })
     }
@@ -204,8 +208,19 @@ impl<'a> Timeline<'a> {
                 let block = self.format_announcement(&msg);
                 self.collect_message(&msg, block)?;
             } else if !msg.is_tapback() && !msg.is_poll_vote() && !msg.is_poll_update() {
-                let block = self.format_timeline_message(&msg)?;
-                self.collect_message(&msg, block)?;
+                // djf.7: as upstream's shared driver does for TXT and HTML,
+                // report a message that cannot be read and keep going, so
+                // one bad row never ends the whole export.
+                match self.format_timeline_message(&msg) {
+                    Ok(block) => self.collect_message(&msg, block)?,
+                    Err(why) => {
+                        self.skipped_messages += 1;
+                        eprintln!(
+                            "Skipping message (rowid={}, guid={}): {}",
+                            msg.rowid, msg.guid, why
+                        );
+                    }
+                }
             }
 
             current_message += 1;
@@ -217,6 +232,13 @@ impl<'a> Timeline<'a> {
         self.flush_grouped()?;
         self.file.flush().map_err(RuntimeError::DiskError)?;
         self.pb.finish();
+
+        if self.skipped_messages > 0 {
+            eprintln!(
+                "{} messages skipped due to formatting errors.",
+                self.skipped_messages
+            );
+        }
         Ok(())
     }
 }
@@ -1692,6 +1714,82 @@ mod tests {
                 .unwrap(),
             "**5:29:42 PM — Me**\n\n*[Attachment: photo.jpg]*\n\n"
         );
+    }
+
+    // MARK: Unreadable messages (djf.7)
+    const UNREADABLE_ROW: i32 = 9100;
+    const UNREADABLE_TEXT: &str = "this message cannot be read";
+
+    /// A copy of the fixture `test.db` plus one message that cannot be read:
+    /// its attachment join row points at an attachment that does not exist,
+    /// as in a damaged database, so loading its attachments fails. It is the
+    /// earliest message, so every fixture message is exported after it.
+    fn db_with_unreadable_message() -> std::path::PathBuf {
+        let test_data = std::env::current_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("imessage-database/test_data");
+        let path = unique_test_dir("timeline-unreadable-db").join("chat.db");
+        std::fs::copy(test_data.join("db/test.db"), &path).unwrap();
+
+        let db = Connection::open(&path).unwrap();
+        // The dangling join row is the damage, so allow it.
+        db.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        db.execute(
+            "INSERT INTO message (ROWID, guid, date, is_from_me, text) \
+             VALUES (?1, 'timeline-test-unreadable', ?2, 1, ?3)",
+            params![UNREADABLE_ROW, SAMPLE_DATE, UNREADABLE_TEXT],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (?1, 999999)",
+            params![UNREADABLE_ROW],
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn unreadable_message_is_skipped_and_the_export_finishes() {
+        let mut options = isolated_options("unreadable_message_is_skipped_and_the_export_finishes");
+        options.db_path = db_with_unreadable_message();
+        let export_path = options.export_path.clone();
+        let config = Config::fake_app(options);
+
+        // The seeded message really cannot be read.
+        let mut unreadable = Config::fake_message();
+        unreadable.rowid = UNREADABLE_ROW;
+        unreadable.num_attachments = 1;
+        assert!(
+            Attachment::from_message(
+                config.data_source.db(),
+                &unreadable,
+                &config.data_source.capabilities
+            )
+            .is_err()
+        );
+
+        let mut exporter = Timeline::new(&config).unwrap();
+        exporter.iter_messages().unwrap();
+        assert_eq!(exporter.skipped_messages, 1);
+        drop(exporter);
+
+        let contents = std::fs::read_to_string(export_path.join(TIMELINE_FILENAME)).unwrap();
+        assert!(!contents.contains(UNREADABLE_TEXT), "got:\n{contents}");
+        // All three fixture messages are still exported.
+        for expected in [
+            "*Link*",
+            "eat as quick as possible",
+            "Oh it translated what I sent!",
+        ] {
+            assert!(
+                contents.contains(expected),
+                "missing {expected:?} in:\n{contents}"
+            );
+        }
+        let message_headers = contents.lines().filter(|l| l.starts_with("**")).count();
+        assert_eq!(message_headers, 3, "got:\n{contents}");
     }
 
     // MARK: Heading escape (djf.9)
