@@ -337,6 +337,20 @@ impl Options {
         // Validate the provided export path
         let export_path = validate_path(user_export_path, export_type.as_ref())?;
 
+        // Fork-owned (djf.12 F11): the timeline copies no attachments and sets no file times.
+        // Name each option given that would, then keep the copy method off, so no attachments
+        // folder is made and the free-space estimate counts no attachment bytes.
+        let attachment_manager_mode = if matches!(export_type, Some(ExportType::Timeline)) {
+            for warning in
+                timeline_ignored_options(attachment_manager_type.is_some(), use_message_times)
+            {
+                eprintln!("{warning}");
+            }
+            AttachmentManagerMode::Disabled
+        } else {
+            attachment_manager_mode
+        };
+
         Ok(Options {
             db_path,
             attachment_root: attachment_root.cloned(),
@@ -425,6 +439,23 @@ fn validate_path(
     }
 
     Ok(resolved_path)
+}
+
+/// Fork-owned (djf.12 F11): one warning for each given option that the timeline export ignores.
+fn timeline_ignored_options(copy_method: bool, use_message_times: bool) -> Vec<String> {
+    [
+        (copy_method, OPTION_ATTACHMENT_MANAGER),
+        (use_message_times, OPTION_USE_MESSAGE_TIMES),
+    ]
+    .into_iter()
+    .filter(|(given, _)| *given)
+    .map(|(_, option)| {
+        format!(
+            "Warning: --{option} has no effect with --{OPTION_EXPORT_TYPE} {}",
+            ExportType::Timeline
+        )
+    })
+    .collect()
 }
 
 // MARK: CLI
@@ -639,7 +670,7 @@ mod arg_tests {
     use crate::app::{
         compatibility::attachment_manager::{AttachmentManager, AttachmentManagerMode},
         export_type::ExportType,
-        options::{Options, get_command, validate_path},
+        options::{Options, get_command, timeline_ignored_options, validate_path},
         test_dir::unique_test_dir,
         zone::Zone,
     };
@@ -1226,6 +1257,60 @@ mod arg_tests {
         let command = get_command();
         let args = command.get_matches_from(["imessage-exporter", "-d", "-w", "alice"]);
         assert!(Options::from_args(&args).is_err());
+    }
+
+    #[test]
+    fn timeline_warns_once_for_each_option_it_ignores() {
+        // djf.12 F11
+        assert_eq!(
+            timeline_ignored_options(true, true),
+            vec![
+                String::from("Warning: --copy-method has no effect with --format timeline"),
+                String::from("Warning: --use-message-times has no effect with --format timeline"),
+            ]
+        );
+        assert_eq!(
+            timeline_ignored_options(false, true),
+            vec![String::from(
+                "Warning: --use-message-times has no effect with --format timeline"
+            )]
+        );
+        assert!(timeline_ignored_options(false, false).is_empty());
+    }
+
+    #[test]
+    fn timeline_keeps_the_copy_method_off() {
+        // djf.12 F11: with the copy method off, Config::start makes no attachments folder.
+        let export_dir = unique_test_dir("timeline-copy-method");
+        let export_path = export_dir.to_string_lossy();
+        let args = get_command().get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "timeline",
+            "-c",
+            "clone",
+            "--use-message-times",
+            "-o",
+            &export_path,
+        ]);
+        let timeline = Options::from_args(&args).unwrap();
+        assert_eq!(
+            timeline.attachment_manager.mode,
+            AttachmentManagerMode::Disabled
+        );
+
+        // Other formats keep the copy method they were given.
+        let args = get_command().get_matches_from([
+            "imessage-exporter",
+            "-f",
+            "txt",
+            "-c",
+            "clone",
+            "-o",
+            &export_path,
+        ]);
+        let txt = Options::from_args(&args).unwrap();
+        assert_eq!(txt.attachment_manager.mode, AttachmentManagerMode::Clone);
     }
 
     #[test]
