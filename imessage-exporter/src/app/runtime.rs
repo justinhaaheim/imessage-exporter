@@ -489,17 +489,28 @@ impl Config {
                 continue;
             }
 
+            // djf.12 F6: compare chats as upstream's `ChatToHandle::dedupe` does. A handle
+            // with no handle row stays its own participant (`Participant::Handle`), so a
+            // chat of Alice and such a handle is not Alice's DM.
+            let wanted: BTreeSet<Participant> = resolved_deduped
+                .iter()
+                .map(|deduped_id| Participant::Group(*deduped_id))
+                .collect();
+
             let mut group_matched = false;
             for (chat_id, raw_participants) in &self.chatroom_participants {
-                let chat_deduped: BTreeSet<i32> = raw_participants
+                let chat_participants: BTreeSet<Participant> = raw_participants
                     .iter()
                     // Exclude handle 0 ("Me") since `-w` describes the
                     // *other* participants of the conversation.
                     .filter(|h| **h != 0)
-                    .filter_map(|h| self.real_participants.get(h).copied())
+                    .map(|h| match self.real_participants.get(h) {
+                        Some(group) => Participant::Group(*group),
+                        None => Participant::Handle(*h),
+                    })
                     .collect();
 
-                if chat_deduped == resolved_deduped {
+                if chat_participants == wanted {
                     included.insert(*chat_id);
                     included_handles.extend(&all_raw_handles);
                     group_matched = true;
@@ -2080,6 +2091,24 @@ mod conversation_with_tests {
         assert_eq!(
             app.options.query_context.selected_chat_ids,
             Some(BTreeSet::from([1, 3, 5, 6]))
+        );
+    }
+
+    #[test]
+    fn handle_with_no_handle_row_counts_as_another_participant() {
+        // djf.12 F6, a damaged database. Chat 5 joins Alice (10) and handle 77, which
+        // has no handle row, so it is in no participant group. Chat 5 is a group of
+        // Alice and someone else, not Alice's DM.
+        let mut app = fixture_with_three_people();
+        app.chatroom_participants
+            .insert(5, BTreeSet::from([10, 77]));
+
+        app.options.conversation_with = vec![String::from("Alice")];
+        app.resolve_filtered_handles().unwrap();
+
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([1]))
         );
     }
 
