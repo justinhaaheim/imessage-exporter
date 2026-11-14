@@ -237,13 +237,7 @@ impl<'a> Timeline<'a> {
                 // one bad row never ends the whole export.
                 match self.format_timeline_message(&msg) {
                     Ok(block) => self.collect_message(&msg, block)?,
-                    Err(why) => {
-                        self.skipped_messages += 1;
-                        eprintln!(
-                            "Skipping message (rowid={}, guid={}): {}",
-                            msg.rowid, msg.guid, why
-                        );
-                    }
+                    Err(why) => self.skip_message(&msg, &why),
                 }
             }
 
@@ -269,15 +263,28 @@ impl<'a> Timeline<'a> {
 
 // MARK: Grouping
 impl<'a> Timeline<'a> {
+    /// Leave `msg` out of the timeline because it cannot be read, and report
+    /// it on stderr (djf.7). The total is reported at the end.
+    fn skip_message(&mut self, msg: &Message, why: &dyn std::fmt::Display) {
+        self.skipped_messages += 1;
+        eprintln!(
+            "Skipping message (rowid={}, guid={}): {}",
+            msg.rowid, msg.guid, why
+        );
+    }
+
     /// Add a fully-formatted message block to the in-memory grouping, keyed
     /// by the message's local date and thread.
     fn collect_message(&mut self, msg: &Message, block: String) -> Result<(), RuntimeError> {
-        // If the date can't be parsed, skip the message rather than failing
-        // the whole export. This mirrors the existing exporters' tolerance
-        // for bad date data.
+        // A message whose date cannot be converted has no day to sit under.
+        // Skip it rather than failing the whole export, and report it like
+        // any other message that cannot be read (djf.12 F7).
         let local = match msg.date() {
             Ok(d) => d.with_timezone(&self.config.options.timezone),
-            Err(_) => return Ok(()),
+            Err(why) => {
+                self.skip_message(msg, &why);
+                return Ok(());
+            }
         };
         let day = local.date_naive();
 
@@ -1289,6 +1296,41 @@ mod tests {
         let entry = bucket.values().next().unwrap();
         assert_eq!(entry.messages.len(), 2);
         assert_eq!(entry.first_timestamp, 674526582885055488);
+    }
+
+    #[test]
+    fn message_whose_date_cannot_be_converted_is_skipped_and_counted() {
+        // djf.12 F7: such a message used to vanish without a word.
+        let mut config = Config::fake_app(isolated_options(
+            "message_whose_date_cannot_be_converted_is_skipped_and_counted",
+        ));
+        config.chatrooms.insert(0, fake_chat());
+        config.real_chatrooms.insert(0, 0);
+        let mut exporter = Timeline::new(&config).unwrap();
+
+        let mut bad_date = Config::fake_message_with_text("cannot be placed");
+        bad_date.date = -9_000_000_000_000_000_000;
+        bad_date.chat_id = Some(0);
+        assert!(bad_date.date().is_err());
+        let mut good_date = Config::fake_message_with_text("placed");
+        good_date.date = SAMPLE_DATE;
+        good_date.chat_id = Some(0);
+
+        exporter
+            .collect_message(&bad_date, "bad\n".to_string())
+            .unwrap();
+        exporter
+            .collect_message(&good_date, "good\n".to_string())
+            .unwrap();
+
+        assert_eq!(exporter.skipped_messages, 1);
+        let blocks: Vec<&String> = exporter
+            .grouped
+            .values()
+            .flat_map(|bucket| bucket.values())
+            .flat_map(|entry| &entry.messages)
+            .collect();
+        assert_eq!(blocks, ["good\n"]);
     }
 
     #[test]
