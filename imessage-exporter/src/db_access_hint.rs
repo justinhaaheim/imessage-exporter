@@ -10,10 +10,13 @@
  The copy command names the database that failed (djf.12 F9): the default macOS database in its
  `~/Library/Messages` form, any other database file by its path, and nothing for an iOS backup,
  whose Messages database is one file inside the backup, not something the exporter reads on its own.
+ A path the hint cannot inspect gets a copy command only when it looks like a database file
+ (djf.16 R5).
 */
 
 use std::{
     borrow::Cow,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -87,7 +90,24 @@ enum FailedDb {
     Other(PathBuf),
     /// The Messages database inside an iOS backup: the hint gives no copy command.
     IosBackup,
+    /// A path that is not a database file, or may not be one (djf.16 R5): a folder, or a path
+    /// the hint cannot inspect whose name does not end in `.db` or that lies inside
+    /// `MobileSync/Backup`. The hint gives no copy command, because `cp` would copy nothing
+    /// useful.
+    NotADatabaseFile,
     /// No path is known: the hint gives no copy command.
+    Unknown,
+}
+
+/// What the hint can tell about the failing path on disk (djf.16 R5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathKind {
+    /// A regular file.
+    File,
+    /// A folder, or anything else that is not a regular file.
+    NotAFile,
+    /// The path cannot be inspected, for example because macOS privacy protection blocks a
+    /// folder above it.
     Unknown,
 }
 
@@ -95,8 +115,17 @@ enum FailedDb {
 /// The macOS gate lives here, at the call site, so [`db_access_hint`] stays testable everywhere.
 pub(crate) fn eprint_db_access_hint(why: &RuntimeError, configured: &ConfiguredDb) {
     if cfg!(target_os = "macos") && is_db_access_error(why) {
-        let failed = failed_db(why, configured, default_db_path().as_deref());
+        let failed = failed_db(why, configured, default_db_path().as_deref(), path_kind);
         eprintln!("{}", db_access_hint(std::env::current_exe().ok(), &failed));
+    }
+}
+
+/// Inspect `path` on disk. A failed inspection is [`PathKind::Unknown`], never a kind.
+fn path_kind(path: &Path) -> PathKind {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => PathKind::File,
+        Ok(_) => PathKind::NotAFile,
+        Err(_) => PathKind::Unknown,
     }
 }
 
@@ -112,8 +141,18 @@ fn is_db_access_error(why: &RuntimeError) -> bool {
 
 /// Find the database that failed. `Inaccessible` carries its path. `Permissions` does not: it
 /// comes from opening the configured database, so that path is the one. `default_db` is the
-/// default macOS database path, or `None` when the home directory is unknown.
-fn failed_db(why: &RuntimeError, configured: &ConfiguredDb, default_db: Option<&Path>) -> FailedDb {
+/// default macOS database path, or `None` when the home directory is unknown. `kind_of`
+/// inspects a path on disk ([`path_kind`] outside tests).
+///
+/// A path that cannot be inspected may be a folder: run without `--platform iOS`, an iOS backup
+/// root inside a folder the exporter cannot search fails before its kind is known. Such a path
+/// gets a copy command only when it looks like a database file (djf.16 R5).
+fn failed_db(
+    why: &RuntimeError,
+    configured: &ConfiguredDb,
+    default_db: Option<&Path>,
+    kind_of: impl FnOnce(&Path) -> PathKind,
+) -> FailedDb {
     if configured.ios_backup {
         return FailedDb::IosBackup;
     }
@@ -127,9 +166,28 @@ fn failed_db(why: &RuntimeError, configured: &ConfiguredDb, default_db: Option<&
         // Platform::determine reports the backup's Messages database when it cannot inspect it.
         Some(path) if path.ends_with(DEFAULT_PATH_IOS) => FailedDb::IosBackup,
         Some(path) if default_db == Some(path) => FailedDb::DefaultMacos,
-        Some(path) if path.file_name().is_some() => FailedDb::Other(path.to_path_buf()),
+        Some(path) if path.file_name().is_some() => match kind_of(path) {
+            PathKind::File => FailedDb::Other(path.to_path_buf()),
+            PathKind::Unknown if looks_like_a_database_file(path) => {
+                FailedDb::Other(path.to_path_buf())
+            }
+            PathKind::Unknown | PathKind::NotAFile => FailedDb::NotADatabaseFile,
+        },
         _ => FailedDb::Unknown,
     }
+}
+
+/// True when `path`'s file name ends in `.db` and the path is not inside an iOS backup folder
+/// (`MobileSync/Backup`), whose files are not databases the exporter reads on their own.
+fn looks_like_a_database_file(path: &Path) -> bool {
+    let db_name = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("db"));
+    let parts: Vec<_> = path.components().map(|part| part.as_os_str()).collect();
+    let in_backup = parts.windows(2).any(|pair| {
+        pair[0].eq_ignore_ascii_case("MobileSync") && pair[1].eq_ignore_ascii_case("Backup")
+    });
+    db_name && !in_backup
 }
 
 /// Build the hint text. `exe_path` is the running binary's path from
@@ -169,7 +227,7 @@ fn copy_commands(failed: &FailedDb) -> Option<(String, String)> {
                 ),
             ))
         }
-        FailedDb::IosBackup | FailedDb::Unknown => None,
+        FailedDb::IosBackup | FailedDb::NotADatabaseFile | FailedDb::Unknown => None,
     }
 }
 
@@ -202,9 +260,12 @@ mod tests {
     };
 
     use super::{
-        ConfiguredDb, FailedDb, db_access_hint, failed_db, is_db_access_error, shell_quote,
+        ConfiguredDb, FailedDb, PathKind, db_access_hint, failed_db, is_db_access_error, path_kind,
+        shell_quote,
     };
-    use crate::app::{error::RuntimeError, export_type::ExportType, options::Options};
+    use crate::app::{
+        error::RuntimeError, export_type::ExportType, options::Options, test_dir::unique_test_dir,
+    };
 
     const COPY_LINE: &str =
         r#"    D=$(mktemp -d /tmp/imx.XXXXXX) && cp ~/Library/Messages/chat.db* "$D"/"#;
@@ -230,6 +291,16 @@ mod tests {
         options.db_path = PathBuf::from(path);
         options.platform = platform;
         ConfiguredDb::from_parts(Some(&options), None)
+    }
+
+    /// Inspection that finds a regular file, as for a database whose folder is readable.
+    fn as_file(_: &Path) -> PathKind {
+        PathKind::File
+    }
+
+    /// Inspection that fails, as for a path inside a folder the exporter cannot search.
+    fn uninspectable(_: &Path) -> PathKind {
+        PathKind::Unknown
     }
 
     #[test]
@@ -324,6 +395,7 @@ mod tests {
             &inaccessible(custom),
             &configured(custom, Platform::macOS),
             Some(Path::new(DEFAULT_DB)),
+            as_file,
         );
         assert_eq!(failed, FailedDb::Other(PathBuf::from(custom)));
 
@@ -377,7 +449,8 @@ mod tests {
             failed_db(
                 &permissions(),
                 &configured("/data/chat.db", Platform::macOS),
-                default_db
+                default_db,
+                as_file
             ),
             FailedDb::Other(PathBuf::from("/data/chat.db"))
         );
@@ -385,7 +458,8 @@ mod tests {
             failed_db(
                 &permissions(),
                 &configured(DEFAULT_DB, Platform::macOS),
-                default_db
+                default_db,
+                as_file
             ),
             FailedDb::DefaultMacos
         );
@@ -394,7 +468,8 @@ mod tests {
             failed_db(
                 &permissions(),
                 &ConfiguredDb::from_parts(None, None),
-                default_db
+                default_db,
+                as_file
             ),
             FailedDb::Unknown
         );
@@ -406,6 +481,7 @@ mod tests {
             &inaccessible(DEFAULT_DB),
             &ConfiguredDb::from_parts(None, None),
             Some(Path::new(DEFAULT_DB)),
+            as_file,
         );
         assert_eq!(failed, FailedDb::DefaultMacos);
         // An unknown home directory makes no path the default one.
@@ -413,7 +489,8 @@ mod tests {
             failed_db(
                 &inaccessible(DEFAULT_DB),
                 &ConfiguredDb::from_parts(None, None),
-                None
+                None,
+                as_file
             ),
             FailedDb::Other(PathBuf::from(DEFAULT_DB))
         );
@@ -428,7 +505,8 @@ mod tests {
             failed_db(
                 &inaccessible(&nested),
                 &ConfiguredDb::from_parts(None, None),
-                default_db
+                default_db,
+                as_file
             ),
             FailedDb::IosBackup
         );
@@ -437,7 +515,8 @@ mod tests {
             failed_db(
                 &inaccessible("/Users/someone/Backup/abc"),
                 &ConfiguredDb::from_parts(None, Some(Platform::iOS)),
-                default_db
+                default_db,
+                as_file
             ),
             FailedDb::IosBackup
         );
@@ -446,7 +525,8 @@ mod tests {
             failed_db(
                 &permissions(),
                 &configured("/Users/someone/Backup/abc", Platform::iOS),
-                default_db
+                default_db,
+                as_file
             ),
             FailedDb::IosBackup
         );
@@ -459,5 +539,89 @@ mod tests {
             "iOS hint has a copy command:\n{hint}"
         );
         assert_eq!(hint.lines().count(), 1);
+    }
+
+    #[test]
+    fn uninspectable_backup_root_gets_no_copy_command() {
+        // djf.16 R5: run without --platform iOS, a backup root inside a folder the exporter
+        // cannot search fails before its kind is known. It is not a database file.
+        let default_db = Some(Path::new(DEFAULT_DB));
+        let root = "/Volumes/locked/00008030-001A2B3C4D5E";
+        let failed = failed_db(
+            &inaccessible(root),
+            &ConfiguredDb::from_parts(None, None),
+            default_db,
+            uninspectable,
+        );
+        assert_eq!(failed, FailedDb::NotADatabaseFile);
+
+        let hint = db_access_hint(None, &failed);
+        assert!(hint.contains("System Settings > Privacy & Security > Full Disk Access"));
+        assert!(!hint.contains("cp "), "hint has a copy command:\n{hint}");
+        assert_eq!(hint.lines().count(), 1, "got:\n{hint}");
+    }
+
+    #[test]
+    fn uninspectable_path_gets_a_copy_command_only_when_it_looks_like_a_database_file() {
+        let default_db = Some(Path::new(DEFAULT_DB));
+        let unknown = |path: &str| {
+            failed_db(
+                &inaccessible(path),
+                &ConfiguredDb::from_parts(None, None),
+                default_db,
+                uninspectable,
+            )
+        };
+        for path in ["/Volumes/locked/old-messages.db", "/Volumes/locked/CHAT.DB"] {
+            assert_eq!(
+                unknown(path),
+                FailedDb::Other(PathBuf::from(path)),
+                "{path}"
+            );
+        }
+        for path in [
+            "/Volumes/locked/old-messages.sqlite",
+            "/Volumes/locked/chat.db-wal",
+            "/Volumes/locked/db",
+            "/Users/someone/Library/Application Support/MobileSync/Backup/abc/chat.db",
+            "/Users/someone/Library/Application Support/mobilesync/backup/chat.db",
+        ] {
+            assert_eq!(unknown(path), FailedDb::NotADatabaseFile, "{path}");
+        }
+    }
+
+    #[test]
+    fn inspected_path_gets_a_copy_command_only_when_it_is_a_file() {
+        let default_db = Some(Path::new(DEFAULT_DB));
+        let with_kind = |path: &str, kind: PathKind| {
+            failed_db(
+                &inaccessible(path),
+                &ConfiguredDb::from_parts(None, None),
+                default_db,
+                |_: &Path| kind,
+            )
+        };
+        // A file whose permissions forbid reading it: any name can be copied.
+        assert_eq!(
+            with_kind("/data/messages.sqlite", PathKind::File),
+            FailedDb::Other(PathBuf::from("/data/messages.sqlite"))
+        );
+        // A folder is never copied with cp, whatever its name.
+        assert_eq!(
+            with_kind("/data/folder.db", PathKind::NotAFile),
+            FailedDb::NotADatabaseFile
+        );
+    }
+
+    #[test]
+    fn path_kind_inspects_the_disk_and_reports_a_failed_inspection_as_unknown() {
+        let dir = unique_test_dir("db-access-hint-path-kind");
+        let file = dir.join("chat.db");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(path_kind(&file), PathKind::File);
+        assert_eq!(path_kind(&dir), PathKind::NotAFile);
+        // A path below a regular file can never be inspected.
+        assert_eq!(path_kind(&file.join("below")), PathKind::Unknown);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
