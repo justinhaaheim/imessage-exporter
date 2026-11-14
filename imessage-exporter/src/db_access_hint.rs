@@ -15,7 +15,9 @@ use imessage_database::error::table::{TableConnectError, TableError};
 use crate::app::error::RuntimeError;
 
 /// Copies the live database, with its `-wal` and `-shm` files, to a folder the user can read.
-const COPY_DB: &str = "mkdir -p /tmp/imx && cp ~/Library/Messages/chat.db* /tmp/imx/";
+/// `-m 700` creates the folder private to the user, so other local accounts cannot read the
+/// copy. It sets the mode only when it creates the folder; an existing `/tmp/imx` keeps its mode.
+const COPY_DB: &str = "mkdir -p -m 700 /tmp/imx && cp ~/Library/Messages/chat.db* /tmp/imx/";
 /// Runs the export against that copy.
 const EXPORT_COPY: &str = "imessage-exporter -p /tmp/imx/chat.db <your other options>";
 
@@ -70,7 +72,8 @@ mod tests {
     use super::{db_access_hint, is_db_access_error};
     use crate::app::error::RuntimeError;
 
-    const COPY_LINE: &str = "    mkdir -p /tmp/imx && cp ~/Library/Messages/chat.db* /tmp/imx/";
+    const COPY_LINE: &str =
+        "    mkdir -p -m 700 /tmp/imx && cp ~/Library/Messages/chat.db* /tmp/imx/";
     const EXPORT_LINE: &str = "    imessage-exporter -p /tmp/imx/chat.db <your other options>";
 
     #[test]
