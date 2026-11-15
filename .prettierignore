@@ -37,3 +37,6 @@ coverage
 /docs/
 /README.md
 /.github/
+
+# justin-sdk baseline (appended)
+*.log

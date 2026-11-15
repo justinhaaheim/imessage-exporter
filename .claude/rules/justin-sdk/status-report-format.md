@@ -9,7 +9,9 @@ Rewritten 2026-10-11 for status report v4. Why it has this shape, in Justin's wo
 
 ## The report has two parts
 
-1. **Part 1 is generated.** Before you yield, run `bun run justin-sdk thread status` again: the same command that decided the branch at the start of the turn (below), not a second decision. Paste the block it prints, from the 🛑 line through the `────` line, verbatim at the top of your final message. Never type or edit any of it: the tool builds it from beads, git, the message log and the transcript. Keep its empty lines exactly as printed; it puts two between list items on purpose (see the writing rules below).
+1. **Part 1 is generated.** Before you yield, run `bun run justin-sdk thread status` again: the same command that decided the branch at the start of the turn (below), not a second decision. Paste the block it prints, from the 🛑 line through the line of ♒ that ends it, verbatim at the top of your final message. Read its whole output, because a filter such as `sed`, `head` or `tail` hides the questions. Never type or edit any of it: the tool builds it from beads, git, the message log and the transcript. Keep its empty lines exactly as printed; it puts two between list items on purpose (see the writing rules below).
+   - In the block, 🆕 marks a request or question new since your last report and 🔄 one that changed. An unchanged P2 to P4 question takes one line, and a line after the questions names those. That is the tool's doing: paste it as printed.
+   - When Justin asks for the full report, run `bun run justin-sdk thread status --full` and paste its block the same way. It prints every question in full.
 2. **Part 2 is your own message**, below that line. When the prime directive requires its `Prime directive check:` paragraph in this reply, that paragraph comes first in Part 2, above the headings (prime-directive.md). Write it under the Know-your-reader rule: bullets, short, for a reader who does not remember this session. Use these headings, in this order. Deviations appears on every work turn; the others appear only when they have content.
    - **Answers** — restate each question he asked, then answer it.
    - **Things you should know** — what he needs in order to decide or act, and nothing more.
@@ -18,11 +20,13 @@ Rewritten 2026-10-11 for status report v4. Why it has this shape, in Justin's wo
 
 No JSON, no form, no progress percent. Do not repeat what Part 1 already shows: the requests, the questions, the repo facts.
 
+**One exception: a turn that ends in a handoff.** When a handoff prints its short summary, headed `🤝 **Handed off**`, that summary is your final message in place of both parts. The handoff rule, where this repo has one, says what goes with it. Justin, 2026-11-09: "a much more abbreviated status report", with the full report one command away.
+
 **Decide the branch once, at the start of a work turn.** Run `bun run justin-sdk thread status`. Where that says `Script not found`, the repo is not enrolled in justin-sdk: run `justin-sdk-latest thread status`. If its first line is `SESSION BEADS: ENABLED`, follow the checklist below. If it prints anything else (`SESSION BEADS: DISABLED`, a help screen, an unknown-command or not-found error), this repo is legacy: skip the checklist, put your asks in the report, and use the Legacy section at the end of this file. If it fails in any other way (for example, it finds no session bead for this session), use the Legacy section too, and quote its error in your report.
 
 ## Every turn: the whole checklist
 
-1. **He asks for work.** Run `bun run justin-sdk thread request "<plain-words title>"` at the start, once per request. Name it by the outcome he wants, not by your activity: "Think through how hooks are managed" is the request "Change how justin-sdk hooks are installed", and the thinking is its first stage. Add `--done-when "<criteria>"` when done is not obvious. When the work is an existing bead, run `bun run justin-sdk thread request --bead <id>` instead. What counts as a request, and how to find them in his words: requests.md.
+1. **He asks for work.** Run `bun run justin-sdk thread request "<plain-words title>"` at the start, once per request. Name it by the outcome he wants, not by your activity: "Think through how hooks are managed" is the request "Change how justin-sdk hooks are installed", and the thinking is its first stage. Pass `--short "<2 to 5 words>"` too, like a compact commit message: it is what the cmux workspace description shows for this request. Add `--done-when "<criteria>"` when done is not obvious. When the work is an existing bead, run `bun run justin-sdk thread request --bead <id>` instead. What counts as a request, and how to find them in his words: requests.md.
 2. **You need something from him.** Run `bun run justin-sdk thread ask` at that moment, not at the end (see Asking, below). It does not block the turn: file it and keep working. Never ask only in your message; Part 1 lists only the questions you filed.
 3. **A request reaches a stage.** Run `bun run justin-sdk thread stage <request id> <stage>…` for each stage it really reached (default ladder: `code-done`, `tested`, `built`, `link-sent`, `approved`). When a request is finished, close its bead: `br close <id> --reason "…"`. A request tracks something he wants to exist:
    - A **change** (build, fix, reconfigure, clean up, decide and then do) is finished only when the change exists, or he says he no longer wants it.
@@ -36,9 +40,14 @@ No JSON, no form, no progress percent. Do not repeat what Part 1 already shows: 
    - **What to mark** lists only what the tool cannot work out itself, each with the command that fixes it. Run that command, or skip an item that does not apply.
    - **Keep the overarching request current.** It is the one request whose title says the whole of the work in this session and the sessions it continues, done and open; its title is the session title, which names his inbox entry and the cmux workspace. File it with `bun run justin-sdk thread request --overarching "<title>"`, or mark one already filed with `--overarching --bead <id>`. When What to mark asks whether it still fits, confirm it with `--overarching --bead <id>`, retitle it with `bun run justin-sdk thread title "<title>"` when the work has grown, or file a new one with `--overarching` when the work has changed direction. A successor shares its predecessor's: never file a copy.
    - **If you stop now the inbox will say:** is the status Justin will see. "Open work, no blocker" tells him to resume this session and say continue. Before you stop on it, settle each open request: close it if its work is done; keep working if you can, acting on the default of any P1 to P3 question he has not answered; or, if it cannot move without his answer, file that question as a P0. A turn where he asked you a question is no exception: put the answer in your final message and keep working on the default until something blocks. In his words (2026-10-24): "You shouldn't yield back to me if there are not blockers." Handing off to a new session is not a way to stop.
-5. **He says his answers are in**, or the `[thread]` line in your context counts new answers. Run `bun run justin-sdk thread answers` at the start of the turn and continue from them. If he answers a question in chat instead, record it: `bun run justin-sdk thread answer --ask <question id> "<his answer, verbatim>"`.
+5. **He says his answers are in**, or the `[thread]` line in your context counts new answers. Run `bun run justin-sdk thread answers` at the start of the turn and continue from them. If he answers a question in chat instead, record it: `bun run justin-sdk thread answer --ask <id> "<his answer, verbatim>"`, where `<id>` is the question's id from the block, such as `BD7`, or its bead id.
+   - Each question in the block carries an id in brackets after its number, such as `[BD7]`. The id stays with the question for its life, across reports and handoffs. The number in front of it is only its place in the list, and it moves when a question is filed or answered.
+   - Act on an answer only when it names an id. When he answers with a bare number (`2 yes`) or a Q-number (`Q2 b`), ask him which id he means, and do nothing on a guess.
+   - When you record an answer, repeat the question's title in your message, so he can see which question you recorded.
 
 `thread done`, `thread archive` and `thread note` are Justin's marks. Do not run them unless he asks. `/thread-done` and `/thread-archive` are him asking.
+
+When Justin says this session is private, run `bun run justin-sdk thread private` at once. From then on nothing from the session is written to the threads repo, which is pushed to GitHub.
 
 Subagents (players, explorers, any agent dispatched by another session) never run `thread` commands: they inherit the parent's session id and would write into its session. They report to the session that dispatched them; that session reports for the arc.
 
@@ -48,6 +57,7 @@ Subagents (players, explorers, any agent dispatched by another session) never ru
 bun run justin-sdk thread ask "<one-line question>" --priority <0-4> [--header "<≤12 chars>"] [--context "<text>"]… [--option "Label: why"]… [--recommend <a|b|…>] [--default "<what you do if he never answers>"] [--to <request or bead id>] [--approve | --do]
 ```
 
+- **Before you ask him to start, build or decide work on a bead, run `bun run justin-sdk thread holders <bead id>`** (sandbox off when the bead is in another repo). It names every session that already holds the bead and how far each got. If another session holds it, tell him that instead of asking. Run it again before you restate an older question: on 2026-11-08 a question asked him to start a session for a fix that had been merged five days earlier.
 - Give two or more options, or none. Name the one you recommend with `--recommend`.
 - `--approve` makes it a yes/no. `--do` marks something he has to do himself, such as testing on a device.
 - A P0 takes no `--default`. P1–P3 require one. A P4 needs none.
@@ -101,7 +111,7 @@ Write the whole report by hand as your final message, in the template below. The
 
 | Next step      | Means                                                    |
 | -------------- | -------------------------------------------------------- |
-| `handoff`      | I am out of context; the next session picks this up      |
+| `handoff`      | I am handing off; the next session picks this up         |
 | `answerAsks`   | I need your answers before the next move is worth making |
 | `continue`     | I keep going on this arc                                 |
 | `done`         | The arc is finished                                      |
