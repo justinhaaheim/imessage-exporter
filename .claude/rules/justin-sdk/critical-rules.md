@@ -1,4 +1,4 @@
-<!-- justin-sdk rules · prompts bff67bcd5bc0 (2026-11-15) · modules 5dfdf6b3ee88 · content f21b021c6d8a · GENERATED — run: bun run justin-sdk rules-update -->
+<!-- justin-sdk rules · prompts f465184763e7 (2026-11-23) · modules 5dfdf6b3ee88 · content 844366ee1244 · GENERATED — run: bun run justin-sdk rules-update -->
 
 # Critical Rules
 
@@ -102,13 +102,15 @@ Before doing anything, decide which case you're in:
 
 ## 3.5 When you finish (or hit a stopping point)
 
-- The `.beads/` directory IS the source of truth, and most projects **auto-flush** it to `.beads/issues.jsonl`. **But you must remember to COMMIT that file** — it happens often that beads get changed and then left uncommitted. Stage and commit it alongside your code changes so beads state travels with the branch.
+- The `.beads/` directory IS the source of truth, and most projects **auto-flush** it to `.beads/issues.jsonl`. **But you must remember to COMMIT that file** — it happens often that beads get changed and then left uncommitted. Commit it by explicit path (`git commit -m '…' -- .beads/issues.jsonl`), in the checkout whose copy changed: with br 0.4.1 or later that is always the main checkout, even when you worked in a worktree; with an older br it is your own checkout, alongside your code, so beads state travels with the branch (see Notes).
 - If the work is a multi-bead epic and you're handing off mid-stream, give a **short handoff message** for the next agent: the epic id, the branch, what's done, and what's next (which bead to claim). The message is a pointer, not the record — the detail must already be in the bead bodies, since the message is gone the moment the session is.
 
 ## 3.6 Notes
 
 - If beads doesn't appear to be set up in a project, do NOT run `br init` yourself — flag it to the human instead ("my guidance says to use beads, but it doesn't look set up here yet").
-- Beads are local to a branch / worktree. To see beads created in a worktree you must `cd` into that worktree first — if you've been told to work on a bead in a particular worktree, check out that worktree before running any `br` commands.
+- **Which database a worktree uses depends on the br the repo pins** (`br --version`):
+  - **br 0.4.1 or later:** every worktree shares the main checkout's database, and every write, from any checkout, rewrites the MAIN checkout's `.beads/issues.jsonl`. A branch carries no beads changes, so there is nothing to `cd` into and nothing to merge. A worktree holding its own `.beads/beads.db` is a fault: br uses that local file instead of main's, and `justin-sdk doctor` names it.
+  - **Older br:** beads are local to a branch / worktree. To see beads created in a worktree you must `cd` into that worktree first — if you've been told to work on a bead in a particular worktree, check out that worktree before running any `br` commands.
 - To use ANOTHER repo's beads, run `br --db <that repo>/.beads/beads.db …` with `br` as the first word, not `cd <other repo> && br …`. A leading `cd` keeps the whole command inside the sandbox even when `br` is in `excludedCommands`, and the sandbox cannot write another repo's database, so it fails with `Database error: I/O error`. A `cd` into a worktree of the current checkout is fine.
 - Bead types: `task`, `bug`, `feature`, `epic`, `chore`, `docs`, `question`. Priorities are 0–4 (P0 = critical, P4 = backlog).
 - Dependency directions matter. The short version: use `--parent EPIC_ID` for epic / sub-bead; use `br dep add <waiter> <waited-on>` (default `--type blocks`) for true sequencing.
